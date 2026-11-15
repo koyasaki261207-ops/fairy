@@ -1,58 +1,69 @@
 """
 BỘ NÃO ANTHROPIC CLAUDE (CLAUDE REACT ENGINE)
-Hỗ trợ các mô hình: Claude 3.7 Sonnet, Claude 3.5 Sonnet, Claude 3.5 Haiku.
-Hỗ trợ đầy đủ Computer Use, Tool Calling và Phân tích hình ảnh thị giác (Multimodal Vision).
+Hỗ trợ Tool Calling và Phân tích hình ảnh thị giác (Multimodal Vision).
+
+Tối ưu token:
+- Prompt caching: 1 điểm cache cho (tools + system) cố định, 1 điểm cache trượt ở cuối hội thoại
+  -> mỗi bước chỉ trả giá đầy đủ cho phần mới, phần cũ đọc từ cache (~10% giá).
+- Schema công cụ gọn (mô tả 1 dòng, không mô tả tham số lặp lại).
+- Chỉ giữ N ảnh chụp màn hình gần nhất; kết quả công cụ bị cắt gọn; lịch sử cũ nén theo đợt.
 """
 
 import base64
 import inspect
-import time
-from pathlib import Path
 import anthropic
 
 from config import config
 from core.safety import safety
 from core.controller import controller
 from core.vision import vision
-from core.tools import ALL_TOOLS, TOOL_MAP
-from core.brain import SYSTEM_INSTRUCTION
+from core.tools import ALL_TOOLS, dispatch_tool
+from core.prompts import SYSTEM_INSTRUCTION
+from core.context import (
+    prune_claude_images,
+    compact_claude_history,
+    set_claude_cache_breakpoint,
+    format_args,
+)
+
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
+NUDGE_TEXT = "Hãy gọi công cụ tiếp theo hoặc gọi finish_task nếu bạn đã hoàn thành nhiệm vụ."
+
+_PY_TO_JSON_TYPE = {int: "integer", float: "number", bool: "boolean", str: "string"}
 
 
 def func_to_anthropic_tool(func) -> dict:
-    """Tự động chuyển đổi hàm Python sang schema Tool của Anthropic Claude"""
+    """Tự động chuyển đổi hàm Python sang schema Tool của Anthropic Claude (gọn nhẹ)."""
     sig = inspect.signature(func)
-    doc = inspect.getdoc(func) or ""
+    doc = " ".join((inspect.getdoc(func) or "").split())  # gộp khoảng trắng/xuống dòng thừa
     properties = {}
     required = []
 
     for param_name, param in sig.parameters.items():
-        p_type = "string"
-        if param.annotation == int:
-            p_type = "integer"
-        elif param.annotation == float:
-            p_type = "number"
-        elif param.annotation == bool:
-            p_type = "boolean"
-
-        properties[param_name] = {
-            "type": p_type,
-            "description": f"Tham số {param_name}"
-        }
-        if param.default == inspect.Parameter.empty:
+        prop = {"type": _PY_TO_JSON_TYPE.get(param.annotation, "string")}
+        if param.default is inspect.Parameter.empty:
             required.append(param_name)
+        else:
+            prop["default"] = param.default
+        properties[param_name] = prop
 
     return {
         "name": func.__name__,
-        "description": doc.strip()[:1000],
+        "description": doc[:600],
         "input_schema": {
             "type": "object",
             "properties": properties,
-            "required": required
-        }
+            "required": required,
+        },
     }
 
 
 CLAUDE_TOOLS_SCHEMA = [func_to_anthropic_tool(f) for f in ALL_TOOLS]
+
+# System prompt dạng block có cache_control: cache luôn cả danh sách tools đứng trước nó.
+CLAUDE_SYSTEM_BLOCKS = [
+    {"type": "text", "text": SYSTEM_INSTRUCTION, "cache_control": {"type": "ephemeral"}}
+]
 
 
 class ClaudeBrain:
@@ -67,7 +78,8 @@ class ClaudeBrain:
             raise ValueError(
                 "Chưa cấu hình ANTHROPIC_API_KEY! Hãy nhập API Key trong phần Cài Đặt hoặc file .env."
             )
-        self.client = anthropic.Anthropic(api_key=key)
+        # SDK tự retry 429/5xx/529 với backoff
+        self.client = anthropic.Anthropic(api_key=key, max_retries=4)
 
     def log(self, tag: str, msg: str):
         if self.log_callback:
@@ -89,7 +101,7 @@ class ClaudeBrain:
             self.set_status("Lỗi Claude API Key")
             return {"success": False, "error": str(e)}
 
-        model_name = config.claude_model or "claude-3-5-sonnet-20241022"
+        model_name = config.claude_model or DEFAULT_CLAUDE_MODEL
         self.set_status("Đang khởi động Claude...")
         self.log("INFO", f"Bắt đầu nhiệm vụ với Claude ({model_name}): '{goal}'")
 
@@ -103,33 +115,41 @@ class ClaudeBrain:
             f"Hãy bắt đầu phân tích và gọi công cụ phù hợp để thực thi mục tiêu."
         )
 
-        messages = [
-            {"role": "user", "content": initial_context}
-        ]
+        messages = [{"role": "user", "content": initial_context}]
 
         step = 0
         max_steps = config.max_steps
         task_finished = False
         final_summary = ""
+        usage_total = {"in": 0, "cache_read": 0, "cache_write": 0, "out": 0}
+
+        def stopped_result():
+            reason = safety.get_stop_reason()
+            self.log("STOP", f"ĐÃ DỪNG KHẨN CẤP: {reason}")
+            self.set_status("Đã dừng")
+            return {"success": False, "error": reason}
 
         while step < max_steps and not task_finished:
             step += 1
             if safety.is_stopped():
-                reason = safety.get_stop_reason()
-                self.log("STOP", f"ĐÃ DỪNG KHẨN CẤP: {reason}")
-                self.set_status("Đã dừng")
-                return {"success": False, "error": reason}
+                return stopped_result()
 
             self.set_status(f"Bước {step}/{max_steps}: Claude đang suy luận...")
             self.log("STEP", f"=== BƯỚC {step} (Claude) ===")
 
+            # Giữ ngữ cảnh gọn + đặt điểm cache trượt ở cuối hội thoại
+            prune_claude_images(messages, config.keep_screenshots)
+            if compact_claude_history(messages, config.history_compact_chars):
+                self.log("INFO", "🗜️ Đã nén các kết quả công cụ cũ để tiết kiệm token.")
+            set_claude_cache_breakpoint(messages)
+
             try:
                 response = self.client.messages.create(
                     model=model_name,
-                    max_tokens=2048,
-                    system=SYSTEM_INSTRUCTION,
+                    max_tokens=config.max_output_tokens,
+                    system=CLAUDE_SYSTEM_BLOCKS,
                     tools=CLAUDE_TOOLS_SCHEMA,
-                    messages=messages
+                    messages=messages,
                 )
             except Exception as e:
                 err_msg = str(e)
@@ -137,111 +157,92 @@ class ClaudeBrain:
                 self.set_status("Lỗi API Claude")
                 return {"success": False, "error": err_msg}
 
-            # Lưu response vào messages
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                u_in = usage.input_tokens or 0
+                u_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+                u_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                u_out = usage.output_tokens or 0
+                usage_total["in"] += u_in
+                usage_total["cache_read"] += u_read
+                usage_total["cache_write"] += u_write
+                usage_total["out"] += u_out
+                self.log("INFO", f"📊 Token: vào {u_in} · đọc cache {u_read} · ghi cache {u_write} · ra {u_out}")
+
             messages.append({"role": "assistant", "content": response.content})
 
-            # Tách suy nghĩ (text / thinking) và tool calls
             tool_use_blocks = []
             for block in response.content:
                 if block.type == "thinking":
-                    thinking_content = getattr(block, "thinking", "")
-                    if thinking_content.strip():
-                        self.log("THOUGHT", f"🤔 [Suy nghĩ sâu]: {thinking_content.strip()}")
-                elif block.type == "text" and getattr(block, "text", "").strip():
+                    thinking_content = (getattr(block, "thinking", "") or "").strip()
+                    if thinking_content:
+                        self.log("THOUGHT", f"🤔 [Suy nghĩ sâu]: {thinking_content}")
+                elif block.type == "text" and (getattr(block, "text", "") or "").strip():
                     text_content = block.text.strip()
                     self.log("THOUGHT", text_content)
-                    if "hoàn thành" in text_content.lower() or "đã xong" in text_content.lower():
+                    low = text_content.lower()
+                    if "hoàn thành" in low or "đã xong" in low:
                         final_summary = text_content
                 elif block.type == "tool_use":
                     tool_use_blocks.append(block)
+
+            if response.stop_reason == "refusal":
+                self.set_status("Claude từ chối")
+                return {"success": False, "error": "Claude từ chối thực hiện yêu cầu này."}
 
             if not tool_use_blocks:
                 if final_summary:
                     task_finished = True
                     break
-                messages.append({
-                    "role": "user",
-                    "content": "Hãy gọi công cụ tiếp theo hoặc gọi finish_task nếu bạn đã hoàn thành nhiệm vụ."
-                })
+                messages.append({"role": "user", "content": NUDGE_TEXT})
                 continue
 
-            # Thực thi các tool calls
             tool_results = []
             for block in tool_use_blocks:
+                if safety.is_stopped():
+                    return stopped_result()
+
                 fn_name = block.name
                 fn_args = block.input or {}
-                tool_id = block.id
-
-                if safety.is_stopped():
-                    reason = safety.get_stop_reason()
-                    self.log("STOP", f"ĐÃ DỪNG KHẨN CẤP: {reason}")
-                    self.set_status("Đã dừng")
-                    return {"success": False, "error": reason}
-
-                args_preview = ", ".join(f"{k}='{v}'" if isinstance(v, str) else f"{k}={v}" for k, v in fn_args.items())
-                self.log("ACTION", f"⚡ {fn_name}({args_preview})")
+                self.log("ACTION", f"⚡ {fn_name}({format_args(fn_args)})")
                 self.set_status(f"Claude thực thi: {fn_name}")
 
-                extra_image_b64 = None
-                if fn_name == "finish_task":
+                outcome = dispatch_tool(fn_name, fn_args, config.max_tool_result_chars)
+                if outcome.finished:
                     task_finished = True
-                    final_summary = fn_args.get("summary", "Đã hoàn thành nhiệm vụ.")
-                    tool_res_str = f"Nhiệm vụ hoàn thành: {final_summary}"
-                elif fn_name == "take_screenshot_to_see":
-                    try:
-                        img_bytes, sw, sh = vision.capture_screen_bytes(max_dimension=1280, quality=75)
-                        extra_image_b64 = base64.b64encode(img_bytes).decode("utf-8")
-                        tool_res_str = f"Đã chụp ảnh màn hình ({sw}x{sh} px). Ảnh đính kèm vào tầm nhìn AI."
-                    except Exception as ex:
-                        tool_res_str = f"Lỗi chụp màn hình: {ex}"
-                elif fn_name in TOOL_MAP:
-                    try:
-                        tool_func = TOOL_MAP[fn_name]
-                        tool_res_str = str(tool_func(**fn_args))
-                    except Exception as ex:
-                        tool_res_str = f"Lỗi thực thi công cụ {fn_name}: {ex}"
-                else:
-                    tool_res_str = f"Lỗi: Không tìm thấy công cụ '{fn_name}'"
+                    final_summary = outcome.summary
+                self.log("OBSERVATION", f"👁️ Kết quả: {outcome.text}")
 
-                self.log("OBSERVATION", f"👁️ Kết quả: {tool_res_str}")
-
-                if extra_image_b64:
+                if outcome.image:
                     tool_content = [
-                        {"type": "text", "text": tool_res_str},
+                        {"type": "text", "text": outcome.text},
                         {
                             "type": "image",
                             "source": {
                                 "type": "base64",
                                 "media_type": "image/jpeg",
-                                "data": extra_image_b64
-                            }
-                        }
+                                "data": base64.b64encode(outcome.image).decode("ascii"),
+                            },
+                        },
                     ]
                 else:
-                    tool_content = tool_res_str
+                    tool_content = outcome.text
 
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": tool_content
-                })
+                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": tool_content})
 
-            messages.append({
-                "role": "user",
-                "content": tool_results
-            })
+            messages.append({"role": "user", "content": tool_results})
 
-            if task_finished:
-                break
-
-            time.sleep(config.action_delay)
-
+        self.log(
+            "INFO",
+            f"📊 Tổng token: vào {usage_total['in']} · đọc cache {usage_total['cache_read']} · "
+            f"ghi cache {usage_total['cache_write']} · ra {usage_total['out']} · {step} bước",
+        )
         if task_finished:
             self.set_status("Hoàn thành xuất sắc!")
             self.log("SUCCESS", f"🎉 {final_summary}")
             return {"success": True, "summary": final_summary}
-        else:
-            self.set_status("Hết số bước tối đa")
-            msg = f"Đã đạt giới hạn {max_steps} bước nhưng chưa hoàn thành toàn bộ."
-            self.log("WARN", msg)
-            return {"success": False, "error": msg}
+
+        self.set_status("Hết số bước tối đa")
+        msg = f"Đã đạt giới hạn {max_steps} bước nhưng chưa hoàn thành toàn bộ."
+        self.log("WARN", msg)
+        return {"success": False, "error": msg}

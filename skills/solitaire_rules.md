@@ -39,3 +39,12 @@ Mỗi khi chụp ảnh màn hình, AI PHẢI duyệt kỹ theo 4 bước sau tro
 
 ## 6. CÔNG CỤ HỖ TRỢ KIỂM ĐỊNH (GUARDRAIL TOOL)
 - Luôn có thể gọi `validate_card_move(source_card='...', target_card='...')` để kiểm tra tính hợp lệ trước khi thao tác chuột.
+
+## 7. CÔNG CỤ DI CHUYỂN BÀI (ƯU TIÊN DÙNG)
+- `solitaire_move_by_column(from_col, to_col, source_card, target_card)`: tự căn tọa độ cột, tự kiểm định luật, kích hoạt cửa sổ game.
+  - `from_col`: 1..7 là Cột 1..7; 0 là Chồng bài lật (Waste).
+  - `to_col`: 1..7 là Cột 1..7; 8 là 4 Ô đích (Foundations).
+  - Ví dụ: 7 Rô ở Cột 5 sang 8 Tép ở Cột 6 -> `solitaire_move_by_column(from_col=5, to_col=6, source_card='7 Rô', target_card='8 Tép')`.
+  - Bốc cả cụm [4♣, 3♥] ở Cột 4 sang 5♦ ở Cột 5 -> `solitaire_move_by_column(from_col=4, to_col=5, source_card='4 Tép', target_card='5 Rô')` (truyền lá GỐC của cụm).
+- `solitaire_draw_card()`: rút bài mới từ Stockpile — chỉ khi đã quét hết mà không còn nước đi hợp lệ.
+- Mẹo tiết kiệm: sau mỗi ảnh chụp, ghi ngắn trạng thái bàn bài (lá ngửa trên cùng của 7 cột, Waste, 4 ô đích) trong suy nghĩ, vì ảnh cũ sẽ bị lược khỏi lịch sử.

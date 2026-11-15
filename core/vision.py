@@ -16,9 +16,9 @@ except ImportError:
     HAS_MSS = False
 
 from core.safety import safety
+from config import config
 
 SCREENSHOTS_DIR = Path(__file__).resolve().parent.parent / "logs" / "screenshots"
-SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class VisionManager:
@@ -31,67 +31,68 @@ class VisionManager:
         self.screen_width, self.screen_height = pyautogui.size()
         return self.screen_width, self.screen_height
 
-    def capture_screen(self, max_dimension: int = 1600, quality: int = 80) -> tuple[Image.Image, Path | None]:
-        """
-        Chụp màn hình chính bằng MSS siêu tốc (hoặc fallback ImageGrab).
-        Tự động nén để gửi lên Gemini API nhanh nhất và tiết kiệm băng thông.
-        """
-        pil_img = None
-        self.get_screen_size()
-
-        # Thử chụp bằng MSS (nhanh gấp 5-10 lần)
+    def _grab(self) -> Image.Image:
+        """Chụp màn hình chính bằng MSS siêu tốc (fallback ImageGrab, cuối cùng là ảnh báo lỗi)."""
         if HAS_MSS:
             try:
-                with mss.MSS() as sct:
+                factory = getattr(mss, "MSS", None) or mss.mss
+                with factory() as sct:
                     # Monitor 1 thường là màn hình chính
                     monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
                     sct_img = sct.grab(monitor)
-                    pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                    return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
             except Exception:
-                pil_img = None
-
-        # Fallback bằng PIL ImageGrab nếu MSS lỗi
-        if pil_img is None:
-            try:
-                from PIL import ImageGrab
-                pil_img = ImageGrab.grab()
-            except Exception as e:
-                # Nếu chạy ở môi trường không có GUI display (headless)
-                # Tạo một ảnh thông báo lỗi để không làm sập luồng
-                pil_img = Image.new("RGB", (self.screen_width, self.screen_height), color=(30, 30, 30))
-                draw = ImageDraw.Draw(pil_img)
-                draw.text((50, 50), f"Không thể chụp màn hình: {e}", fill=(255, 100, 100))
-
-        # Lưu ảnh tạm thời vào thư mục logs
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        save_path = SCREENSHOTS_DIR / f"screen_{timestamp}.jpg"
-
-        # Tối ưu kích thước nếu màn hình quá lớn (ví dụ 4K)
-        w, h = pil_img.size
-        if max(w, h) > max_dimension:
-            scale = max_dimension / max(w, h)
-            new_size = (int(w * scale), int(h * scale))
-            img_to_save = pil_img.resize(new_size, Image.Resampling.LANCZOS)
-        else:
-            img_to_save = pil_img
-
+                pass
         try:
-            img_to_save.save(save_path, "JPEG", quality=quality)
+            from PIL import ImageGrab
+            return ImageGrab.grab()
+        except Exception as e:
+            # Môi trường không có GUI display (headless): tạo ảnh thông báo lỗi để không sập luồng
+            img = Image.new("RGB", (self.screen_width, self.screen_height), color=(30, 30, 30))
+            ImageDraw.Draw(img).text((50, 50), f"Không thể chụp màn hình: {e}", fill=(255, 100, 100))
+            return img
+
+    @staticmethod
+    def _downscale(img: Image.Image, max_dimension: int) -> Image.Image:
+        w, h = img.size
+        if max(w, h) <= max_dimension:
+            return img
+        scale = max_dimension / max(w, h)
+        return img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+
+    def capture_screen(self, max_dimension: int = 1600, quality: int = 80) -> tuple[Image.Image, Path | None]:
+        """Chụp màn hình (ảnh gốc) và lưu bản thu nhỏ vào logs/screenshots."""
+        self.get_screen_size()
+        pil_img = self._grab()
+        save_path = SCREENSHOTS_DIR / f"screen_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+        try:
+            SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            self._downscale(pil_img, max_dimension).save(save_path, "JPEG", quality=quality)
         except Exception:
             save_path = None
-
         return pil_img, save_path
 
-    def capture_screen_bytes(self, max_dimension: int = 1280, quality: int = 75) -> tuple[bytes, int, int]:
+    def capture_screen_bytes(self, max_dimension: int | None = None, quality: int | None = None) -> tuple[bytes, int, int]:
         """
-        Chụp màn hình và trả về dữ liệu ảnh dạng bytes (JPEG) tối ưu,
-        kèm kích thước thực tế (width, height) để gửi thẳng cho Gemini Vision.
+        Chụp màn hình và trả về JPEG đã THU NHỎ (cạnh dài <= max_dimension) để gửi lên AI,
+        kèm kích thước thực của màn hình. Ảnh nhỏ hơn = ít token hơn + upload nhanh hơn.
+        Tọa độ dùng thang chuẩn hóa 0-1000 nên việc thu nhỏ không làm lệch thao tác chuột.
         """
-        pil_img, _ = self.capture_screen(max_dimension=max_dimension, quality=quality)
+        max_dimension = max_dimension or config.screenshot_max_dim
+        quality = quality or config.screenshot_quality
         w, h = self.get_screen_size()
+        img = self._downscale(self._grab(), max_dimension)
         buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=quality)
-        return buf.getvalue(), w, h
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        data = buf.getvalue()
+
+        if config.save_screenshots:
+            try:
+                SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+                (SCREENSHOTS_DIR / f"screen_{time.strftime('%Y%m%d_%H%M%S')}.jpg").write_bytes(data)
+            except Exception:
+                pass
+        return data, w, h
 
     def denormalize_coordinates(self, x_norm: float, y_norm: float) -> tuple[int, int]:
         """

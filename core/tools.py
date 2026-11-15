@@ -4,8 +4,8 @@ Bao gồm cả 3 tầng: Lệnh hệ thống, Windows UIAutomation và Thao tác
 """
 
 import time
-import json
 from core.controller import controller
+from core.context import compact_json, one_line, truncate_text
 from core.uiauto import uiauto
 from core.safety import safety
 
@@ -20,6 +20,9 @@ def run_powershell(command: str) -> str:
     if not res.get("success"):
         return f"Thất bại: {res.get('error') or res.get('stderr')}"
     out = res.get("stdout", "")
+    err = res.get("stderr", "")
+    if err:
+        out = f"{out}\nSTDERR:\n{truncate_text(err, 800)}".strip()
     return f"Thành công. Kết quả:\n{out}" if out else "Thành công (lệnh không trả về output)."
 
 
@@ -327,7 +330,7 @@ def type_vietnamese_text(text: str) -> str:
     """
     ok = controller.type_text(text)
     if ok:
-        return f"Đã gõ văn bản: '{text}'"
+        return f"Đã gõ {len(text)} ký tự: '{one_line(text, 80)}'"
     return "Thất bại khi gõ văn bản."
 
 
@@ -371,7 +374,7 @@ def inspect_active_window() -> str:
         "interactive_elements_count": len(elements),
         "sample_elements": elements[:15]
     }
-    return json.dumps(summary, ensure_ascii=False, indent=2)
+    return compact_json(summary)
 
 
 def wait_seconds(seconds: float) -> str:
@@ -549,18 +552,14 @@ from core.agent_desktop import agent_desktop
 
 def desktop_snapshot(app_name: str = "") -> str:
     """
-    Chụp cây giao diện ngữ nghĩa (Accessibility Tree Snapshot) của ứng dụng bằng Vercel agent-desktop.
-    Trả về cấu trúc JSON chứa tất cả các phần tử tương tác (Button, Edit, Menu, Tab...) kèm mã định danh @ref ID (ví dụ @s8f3k2p9:e5).
-    LỢI ÍCH VƯỢT TRỘI:
-    - Cực kỳ nhẹ (vài KB), tiết kiệm 95% token so với gửi ảnh chụp màn hình.
-    - Chuẩn xác 100%, không bao giờ bị lệch tọa độ hay đoán mò pixel.
-    - Dùng mã @ref nhận được để gọi ngay desktop_click(ref_id='...') hoặc desktop_type(ref_id='...', text='...').
+    Chụp cây Accessibility của ứng dụng (agent-desktop): JSON gọn liệt kê các phần tử tương tác
+    (Button, Edit, Menu, Tab...) kèm mã @ref (ví dụ @s8f3k2p9:e5). Rẻ hơn nhiều so với ảnh chụp màn hình.
+    Dùng @ref nhận được cho desktop_click / desktop_type.
     """
     res = agent_desktop.snapshot(app=app_name, interactive_only=True, compact=True)
     if not res.get("ok"):
         return f"Snapshot thất bại: {res.get('error') or res.get('raw_stderr') or 'Lỗi không xác định'}"
-    data = res.get("data", {})
-    return json.dumps(data, ensure_ascii=False, indent=2)
+    return compact_json(res.get("data", {}))
 
 
 def desktop_click(ref_id: str) -> str:
@@ -586,7 +585,7 @@ def desktop_type(ref_id: str, text: str) -> str:
     """
     res = agent_desktop.type_text(ref_id, text)
     if res.get("ok"):
-        return f"Thành công: Đã nhập '{text}' vào phần tử '{ref_id}'."
+        return f"Thành công: Đã nhập {len(text)} ký tự vào phần tử '{ref_id}'."
     return f"Thất bại khi nhập văn bản: {res.get('error')}"
 
 
@@ -598,7 +597,7 @@ def desktop_find(app_name: str, query: str = "", role: str = "") -> str:
     res = agent_desktop.find_elements(app=app_name, query=query, role=role)
     if not res.get("ok"):
         return f"Không tìm thấy phần tử: {res.get('error')}"
-    return json.dumps(res.get("data", {}), ensure_ascii=False, indent=2)
+    return compact_json(res.get("data", {}))
 
 
 def desktop_focus_window(app_name: str) -> str:
@@ -655,3 +654,47 @@ ALL_TOOLS = [
 
 # Ánh xạ tên hàm -> hàm thực thi
 TOOL_MAP = {func.__name__: func for func in ALL_TOOLS}
+
+
+# ========================================================
+# BỘ ĐIỀU PHỐI CÔNG CỤ DÙNG CHUNG CHO MỌI "BỘ NÃO" (GEMINI / CLAUDE)
+# ========================================================
+
+class ToolOutcome:
+    __slots__ = ("text", "image", "finished", "summary")
+
+    def __init__(self, text: str, image: bytes | None = None, finished: bool = False, summary: str = ""):
+        self.text = text
+        self.image = image
+        self.finished = finished
+        self.summary = summary
+
+
+def dispatch_tool(fn_name: str, fn_args: dict, max_chars: int = 4000) -> ToolOutcome:
+    """Thực thi 1 lệnh gọi công cụ và chuẩn hóa kết quả (đã cắt gọn) để gửi lại cho AI."""
+    fn_args = dict(fn_args or {})
+    if fn_name == "finish_task":
+        summary = fn_args.get("summary") or "Đã hoàn thành nhiệm vụ."
+        return ToolOutcome(f"Nhiệm vụ hoàn thành: {summary}", finished=True, summary=summary)
+
+    if fn_name == "take_screenshot_to_see":
+        try:
+            from core.vision import vision
+            img_bytes, sw, sh = vision.capture_screen_bytes()
+            return ToolOutcome(
+                f"Đã chụp màn hình ({sw}x{sh} px), ảnh đính kèm. Tọa độ dùng thang chuẩn hóa 0-1000.",
+                image=img_bytes,
+            )
+        except Exception as ex:
+            return ToolOutcome(f"Lỗi chụp ảnh màn hình: {ex}")
+
+    func = TOOL_MAP.get(fn_name)
+    if func is None:
+        return ToolOutcome(f"Lỗi: Không tìm thấy công cụ '{fn_name}'")
+    try:
+        result = str(func(**fn_args))
+    except TypeError as ex:
+        result = f"Lỗi tham số khi gọi {fn_name}: {ex}"
+    except Exception as ex:
+        result = f"Lỗi khi thực thi công cụ {fn_name}: {ex}"
+    return ToolOutcome(truncate_text(result, max_chars))
