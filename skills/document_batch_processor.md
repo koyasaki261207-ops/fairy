@@ -1,5 +1,7 @@
 # 📄 KỸ NĂNG: XỬ LÝ & TÓM TẮT TÀI LIỆU HÀNG LOẠT (BATCH PROCESSING)
 
+**Từ khóa:** tài liệu, tom tat, tóm tắt, pdf, word, docx, slide, chapter, thư mục, tệp, doc, batch, summary
+
 ## 1. MỤC TIÊU
 Đọc, phân tích và tóm tắt nhanh hàng loạt tài liệu (PDF, Word, Text, Code) chỉ trong 3-5 bước, tiết kiệm tối đa số lượng API request.
 

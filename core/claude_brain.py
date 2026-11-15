@@ -17,7 +17,8 @@ from config import config
 from core.safety import safety
 from core.controller import controller
 from core.vision import vision
-from core.tools import ALL_TOOLS, dispatch_tool
+from core.tools import ALL_TOOLS, dispatch_tool, reset_run_state
+from core.guard import RunGuard, skill_hint
 from core.prompts import SYSTEM_INSTRUCTION
 from core.context import (
     prune_claude_images,
@@ -112,10 +113,13 @@ class ClaudeBrain:
             f"Thông tin hệ thống:\n"
             f"- Cửa sổ đang mở: {fg_win.get('title', 'Không xác định')}\n"
             f"- Kích thước màn hình: {screen_w} x {screen_h} pixels.\n"
+            f"{skill_hint(goal)}"
             f"Hãy bắt đầu phân tích và gọi công cụ phù hợp để thực thi mục tiêu."
         )
 
         messages = [{"role": "user", "content": initial_context}]
+        reset_run_state()
+        guard = RunGuard()
 
         step = 0
         max_steps = config.max_steps
@@ -207,7 +211,7 @@ class ClaudeBrain:
                 self.log("ACTION", f"⚡ {fn_name}({format_args(fn_args)})")
                 self.set_status(f"Claude thực thi: {fn_name}")
 
-                outcome = dispatch_tool(fn_name, fn_args, config.max_tool_result_chars)
+                outcome = dispatch_tool(fn_name, fn_args, config.max_tool_result_chars, guard=guard)
                 if outcome.finished:
                     task_finished = True
                     final_summary = outcome.summary
@@ -230,6 +234,9 @@ class ClaudeBrain:
 
                 tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": tool_content})
 
+            notes = guard.pending_notes_text()
+            if notes:
+                tool_results.append({"type": "text", "text": notes})
             messages.append({"role": "user", "content": tool_results})
 
         self.log(

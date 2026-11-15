@@ -550,6 +550,14 @@ def save_skill(skill_name: str, content: str) -> str:
 from core.agent_desktop import agent_desktop
 
 
+_snapshot_cache: dict = {}
+
+
+def reset_run_state():
+    """Xóa trạng thái theo từng lượt chạy (gọi ở đầu mỗi nhiệm vụ)."""
+    _snapshot_cache.clear()
+
+
 def desktop_snapshot(app_name: str = "") -> str:
     """
     Chụp cây Accessibility của ứng dụng (agent-desktop): JSON gọn liệt kê các phần tử tương tác
@@ -559,7 +567,24 @@ def desktop_snapshot(app_name: str = "") -> str:
     res = agent_desktop.snapshot(app=app_name, interactive_only=True, compact=True)
     if not res.get("ok"):
         return f"Snapshot thất bại: {res.get('error') or res.get('raw_stderr') or 'Lỗi không xác định'}"
-    return compact_json(res.get("data", {}))
+    payload = compact_json(res.get("data", {}))
+    key = app_name or "*"
+    prev = _snapshot_cache.get(key)
+    _snapshot_cache[key] = payload
+    if prev == payload:
+        return (
+            "Giao diện KHÔNG thay đổi so với snapshot trước (các @ref cũ vẫn hợp lệ). "
+            "Hành động vừa rồi có thể chưa có tác dụng - hãy thử cách khác hoặc xác nhận bằng ảnh chụp."
+        )
+    return payload
+
+
+def update_memory(notes: str) -> str:
+    """
+    Ghi đè sổ nhớ làm việc (tối đa ~800 ký tự): mục tiêu con, tiến độ, đường dẫn/giá trị quan trọng,
+    trạng thái màn hình. Sổ luôn được đính vào lượt mới nhất và không bị lược bỏ như ảnh/kết quả cũ.
+    """
+    return "Đã ghi nhớ."
 
 
 def desktop_click(ref_id: str) -> str:
@@ -627,6 +652,7 @@ ALL_TOOLS = [
     load_skill,
     save_skill,
     desktop_snapshot,
+    update_memory,
     desktop_click,
     desktop_type,
     desktop_find,
@@ -670,31 +696,46 @@ class ToolOutcome:
         self.summary = summary
 
 
-def dispatch_tool(fn_name: str, fn_args: dict, max_chars: int = 4000) -> ToolOutcome:
-    """Thực thi 1 lệnh gọi công cụ và chuẩn hóa kết quả (đã cắt gọn) để gửi lại cho AI."""
+def dispatch_tool(fn_name: str, fn_args: dict, max_chars: int = 4000, guard=None) -> ToolOutcome:
+    """
+    Thực thi 1 lệnh gọi công cụ và chuẩn hóa kết quả (đã cắt gọn) để gửi lại cho AI.
+    `guard` (core.guard.RunGuard) bổ sung: sổ nhớ, cổng xác minh khi kết thúc, cảnh báo vòng lặp.
+    """
     fn_args = dict(fn_args or {})
     if fn_name == "finish_task":
+        if guard is not None and fn_args.get("is_success", True):
+            bounce = guard.check_finish()
+            if bounce:
+                return ToolOutcome(bounce)
         summary = fn_args.get("summary") or "Đã hoàn thành nhiệm vụ."
         return ToolOutcome(f"Nhiệm vụ hoàn thành: {summary}", finished=True, summary=summary)
 
+    if fn_name == "update_memory" and guard is not None:
+        return ToolOutcome(guard.set_notes(str(fn_args.get("notes", ""))))
+
+    image = None
     if fn_name == "take_screenshot_to_see":
         try:
             from core.vision import vision
             img_bytes, sw, sh = vision.capture_screen_bytes()
-            return ToolOutcome(
-                f"Đã chụp màn hình ({sw}x{sh} px), ảnh đính kèm. Tọa độ dùng thang chuẩn hóa 0-1000.",
-                image=img_bytes,
-            )
+            result = f"Đã chụp màn hình ({sw}x{sh} px), ảnh đính kèm. Tọa độ dùng thang chuẩn hóa 0-1000."
+            image = img_bytes
         except Exception as ex:
-            return ToolOutcome(f"Lỗi chụp ảnh màn hình: {ex}")
+            result = f"Lỗi chụp ảnh màn hình: {ex}"
+    else:
+        func = TOOL_MAP.get(fn_name)
+        if func is None:
+            return ToolOutcome(f"Lỗi: Không tìm thấy công cụ '{fn_name}'")
+        try:
+            result = str(func(**fn_args))
+        except TypeError as ex:
+            result = f"Lỗi tham số khi gọi {fn_name}: {ex}"
+        except Exception as ex:
+            result = f"Lỗi khi thực thi công cụ {fn_name}: {ex}"
 
-    func = TOOL_MAP.get(fn_name)
-    if func is None:
-        return ToolOutcome(f"Lỗi: Không tìm thấy công cụ '{fn_name}'")
-    try:
-        result = str(func(**fn_args))
-    except TypeError as ex:
-        result = f"Lỗi tham số khi gọi {fn_name}: {ex}"
-    except Exception as ex:
-        result = f"Lỗi khi thực thi công cụ {fn_name}: {ex}"
-    return ToolOutcome(truncate_text(result, max_chars))
+    result = truncate_text(result, max_chars)
+    if guard is not None:
+        hint = guard.observe(fn_name, fn_args, result)
+        if hint:
+            result = f"{result}\n{hint}"
+    return ToolOutcome(result, image=image)

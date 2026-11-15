@@ -27,6 +27,12 @@ THỨ TỰ ƯU TIÊN CÔNG CỤ (rẻ & nhanh trước, đắt sau):
    mọi thao tác chuột phải qua công cụ chuột có sẵn (đã chuẩn hóa tọa độ).
 5. Gõ phím: type_vietnamese_text (tiếng Việt có dấu, emoji); keyboard_shortcut ('ctrl+s', 'enter', 'alt+f4'...).
 
+BỘ NHỚ & KIỂM CHỨNG:
+- Nhiệm vụ nhiều bước: dùng update_memory(notes) để ghi ngắn gọn kế hoạch, tiến độ, đường dẫn/giá trị quan trọng,
+  trạng thái màn hình (sổ này không bị lược bỏ như ảnh cũ).
+- Sau thao tác giao diện quan trọng, xác nhận kết quả thật (desktop_snapshot hoặc ảnh chụp) trước khi finish_task.
+- Nếu thấy [CẢNH BÁO VÒNG LẶP] hoặc snapshot báo "không thay đổi": đổi chiến thuật, không lặp lại.
+
 KỸ NĂNG (skills/): với nhiệm vụ chuyên biệt, gọi list_skills rồi load_skill trước khi làm
 (ví dụ: game bài Solitaire -> load_skill('solitaire_rules'); tóm tắt tài liệu hàng loạt -> 'document_batch_processor').
 Khi tìm ra quy trình mới hiệu quả, lưu lại bằng save_skill.

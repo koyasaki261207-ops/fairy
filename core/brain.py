@@ -18,7 +18,8 @@ from config import config
 from core.safety import safety
 from core.controller import controller
 from core.vision import vision
-from core.tools import ALL_TOOLS, dispatch_tool
+from core.tools import ALL_TOOLS, dispatch_tool, reset_run_state
+from core.guard import RunGuard, skill_hint
 from core.prompts import SYSTEM_INSTRUCTION  # noqa: F401  (giữ để tương thích import cũ)
 from core.context import (
     IMAGE_PLACEHOLDER,
@@ -219,10 +220,13 @@ class GeminiBrain:
             f"Thông tin hệ thống:\n"
             f"- Cửa sổ đang mở: {fg_win.get('title', 'Không xác định')}\n"
             f"- Kích thước màn hình: {screen_w} x {screen_h} pixels.\n"
+            f"{skill_hint(goal)}"
             f"Hãy bắt đầu suy nghĩ và gọi các công cụ phù hợp nhất để hoàn thành mục tiêu."
         )
 
         gen_config = self._build_config()
+        reset_run_state()
+        guard = RunGuard()
 
         # Mô hình người dùng chọn luôn được ưu tiên đầu tiên (kể cả khi không nằm trong danh sách dự phòng)
         current_model = config.gemini_model or FALLBACK_MODELS[0]
@@ -320,7 +324,7 @@ class GeminiBrain:
                 self.log("ACTION", f"⚡ {fn_name}({format_args(fn_args)})")
                 self.set_status(f"Đang thực thi: {fn_name}")
 
-                outcome = dispatch_tool(fn_name, fn_args, config.max_tool_result_chars)
+                outcome = dispatch_tool(fn_name, fn_args, config.max_tool_result_chars, guard=guard)
                 if outcome.finished:
                     task_finished = True
                     final_summary = outcome.summary
@@ -335,7 +339,9 @@ class GeminiBrain:
             if task_finished:
                 break
 
-            contents.append(types.Content(role="user", parts=function_response_parts + image_parts))
+            notes = guard.pending_notes_text()
+            extra = [types.Part.from_text(text=notes)] if notes else []
+            contents.append(types.Content(role="user", parts=function_response_parts + image_parts + extra))
 
         self.log(
             "INFO",

@@ -1,5 +1,7 @@
 # 🃏 KỸ NĂNG: CHIẾN THUẬT & LUẬT CHƠI GAME BÀI (SOLITAIRE KLONDIKE)
 
+**Từ khóa:** solitaire, klondike, game, bai, card, cot, chơi bài, xếp bài, patience
+
 ## 1. MỤC TIÊU VÁN BÀI
 Đưa toàn bộ 52 lá bài lên 4 ô đích (Foundations ở góc trên bên phải), xếp theo 4 chất (Cơ, Rô, Bích, Tép) từ Át (A) đến K:
 `A(1) -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10 -> J(11) -> Q(12) -> K(13)`.
