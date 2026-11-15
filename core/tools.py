@@ -3,11 +3,18 @@
 Bao gồm cả 3 tầng: Lệnh hệ thống, Windows UIAutomation và Thao tác chuột/phím Vision.
 """
 
+import re
 import time
 from core.controller import controller
 from core.context import compact_json, one_line, truncate_text
 from core.uiauto import uiauto
 from core.safety import safety
+from core import tools_ext
+from core.tools_ext import (
+    desktop_snapshot, desktop_click, desktop_type, write_text_file, open_app_and_wait, run_actions,
+    run_skill, click_mark, solitaire_best_move,
+)
+from core.recorder import recorder
 
 
 def run_powershell(command: str) -> str:
@@ -51,14 +58,21 @@ def ui_type(name: str, text: str) -> str:
 
 import pyautogui
 
-def _normalize_point(x: float, y: float) -> tuple[int, int]:
+def _normalize_point(x: float, y: float, full: bool = False) -> tuple[int, int]:
     """
     Chuyển đổi tọa độ từ thang chuẩn hóa [0 - 1000] của Gemini Vision
     sang tọa độ pixel thực tế của màn hình máy tính (ví dụ 1920x1200).
     Nếu tọa độ truyền vào đã lớn hơn 1000, giữ nguyên pixel thực tế.
     """
     screen_w, screen_h = pyautogui.size()
-    if x <= 1000 and y <= 1000 and (screen_w > 1000 or screen_h > 1000):
+    from core.vision import vision
+    region = None if full else vision.last_region
+    if region and x <= 1000 and y <= 1000:
+        # Ảnh vừa chụp chỉ là một cửa sổ: tọa độ 0-1000 tính theo ảnh đó
+        left, top, rw, rh = region
+        actual_x = left + int((x / 1000.0) * rw)
+        actual_y = top + int((y / 1000.0) * rh)
+    elif x <= 1000 and y <= 1000 and (screen_w > 1000 or screen_h > 1000):
         actual_x = int((x / 1000.0) * screen_w)
         actual_y = int((y / 1000.0) * screen_h)
     else:
@@ -69,11 +83,11 @@ def _normalize_point(x: float, y: float) -> tuple[int, int]:
     return actual_x, actual_y
 
 
-def take_screenshot_to_see(reason: str = "") -> str:
+def take_screenshot_to_see(reason: str = "", marks: bool = False, window: bool = False) -> str:
     """
-    Chụp ảnh màn hình thực tế và truyền trực tiếp vào tầm nhìn (mắt) của AI.
-    DÙNG CHO: Nhìn các nút biểu tượng, hình ảnh, thanh trượt slider, giao diện web canvas,
-    trình chỉnh sửa ảnh/video, game bài, cờ tướng hoặc bất kỳ giao diện đồ họa nào không có chữ.
+    Chụp ảnh thực tế vào tầm nhìn của AI (cho giao diện đồ họa/canvas/game/biểu tượng không có chữ).
+    marks=true: đánh SỐ lên các phần tử tương tác -> dùng click_mark(số) thay vì đoán tọa độ.
+    window=true: chỉ chụp cửa sổ đang focus (ảnh nhỏ hơn, rõ hơn, ít token hơn); tọa độ 0-1000 tính theo ảnh đó.
     """
     return f"Đã chụp ảnh màn hình để quan sát thị giác: {reason or 'Cập nhật trạng thái hiển thị hiện tại'}"
 
@@ -290,8 +304,8 @@ def solitaire_move_by_column(from_col: int, to_col: int, source_card: str = "", 
     else:
         return f"Lỗi: Cột đích to_col={to_col} không hợp lệ (chỉ nhận 1..8)."
 
-    actual_start_x, actual_start_y = _normalize_point(start_x, start_y)
-    actual_end_x, actual_end_y = _normalize_point(end_x, end_y)
+    actual_start_x, actual_start_y = _normalize_point(start_x, start_y, full=True)
+    actual_end_x, actual_end_y = _normalize_point(end_x, end_y, full=True)
     ok = controller.mouse_drag(actual_start_x, actual_start_y, actual_end_x, actual_end_y, duration=0.4)
     if ok:
         src_name = source_card or f"Cột {from_col}"
@@ -305,7 +319,7 @@ def solitaire_draw_card() -> str:
     Rút lật lá bài mới từ Chồng bài úp (Stockpile ở góc trên bên trái).
     CHỈ DÙNG KHI CẢ 7 CỘT KHÔNG CÒN NƯỚC ĐI NÀO HỢP LỆ!
     """
-    actual_x, actual_y = _normalize_point(247, 200)
+    actual_x, actual_y = _normalize_point(247, 200, full=True)
     ok = controller.mouse_click(actual_x, actual_y)
     if ok:
         return f"Đã click rút lật bài mới từ Chồng bài úp (Stockpile) tại tọa độ ({actual_x}, {actual_y})."
@@ -498,7 +512,7 @@ def list_skills() -> str:
         
     res = [f"Danh sách {len(skills)} kỹ năng có sẵn:"]
     for s in skills:
-        res.append(f"- {s.stem} ({s.suffix})")
+        res.append(f"- {s.stem} (.py: chạy bằng run_skill)" if s.suffix == ".py" else f"- {s.stem} (.md: đọc bằng load_skill)")
     return "\n".join(res)
 
 
@@ -526,18 +540,22 @@ def load_skill(skill_name: str) -> str:
         return f"Lỗi khi đọc kỹ năng: {e}"
 
 
-def save_skill(skill_name: str, content: str) -> str:
+def save_skill(skill_name: str, content: str, kind: str = "md") -> str:
     """
     Tự học & Lưu kỹ năng mới vào hệ thống:
     Khi bạn tìm ra một giải pháp xuất sắc, một quy trình chuẩn hoặc một đoạn mã mẫu giải quyết bài toán khó,
-    hãy gọi hàm này để lưu lại. Lần sau gặp bài toán tương tự, bạn có thể tái sử dụng ngay lập tức!
+    hãy gọi hàm này để lưu lại. kind='md' (cẩm nang chữ) hoặc kind='py' (script chạy được bằng run_skill:
+    đọc tham số JSON từ sys.argv[1], in kết quả ra stdout; dòng đầu docstring nên có 'Từ khóa: ...').
     """
     from pathlib import Path
     skills_dir = Path(__file__).resolve().parent.parent / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
     
     clean_name = skill_name.strip().replace(".md", "").replace(".py", "").replace(" ", "_")
-    target = skills_dir / f"{clean_name}.md"
+    is_py = str(kind).strip().lower() == "py"
+    if is_py and "pyautogui" in content:
+        return "Lỗi: không lưu kỹ năng dùng pyautogui."
+    target = skills_dir / f"{clean_name}{'.py' if is_py else '.md'}"
     
     try:
         with open(target, "w", encoding="utf-8") as f:
@@ -550,33 +568,11 @@ def save_skill(skill_name: str, content: str) -> str:
 from core.agent_desktop import agent_desktop
 
 
-_snapshot_cache: dict = {}
-
-
 def reset_run_state():
     """Xóa trạng thái theo từng lượt chạy (gọi ở đầu mỗi nhiệm vụ)."""
-    _snapshot_cache.clear()
-
-
-def desktop_snapshot(app_name: str = "") -> str:
-    """
-    Chụp cây Accessibility của ứng dụng (agent-desktop): JSON gọn liệt kê các phần tử tương tác
-    (Button, Edit, Menu, Tab...) kèm mã @ref (ví dụ @s8f3k2p9:e5). Rẻ hơn nhiều so với ảnh chụp màn hình.
-    Dùng @ref nhận được cho desktop_click / desktop_type.
-    """
-    res = agent_desktop.snapshot(app=app_name, interactive_only=True, compact=True)
-    if not res.get("ok"):
-        return f"Snapshot thất bại: {res.get('error') or res.get('raw_stderr') or 'Lỗi không xác định'}"
-    payload = compact_json(res.get("data", {}))
-    key = app_name or "*"
-    prev = _snapshot_cache.get(key)
-    _snapshot_cache[key] = payload
-    if prev == payload:
-        return (
-            "Giao diện KHÔNG thay đổi so với snapshot trước (các @ref cũ vẫn hợp lệ). "
-            "Hành động vừa rồi có thể chưa có tác dụng - hãy thử cách khác hoặc xác nhận bằng ảnh chụp."
-        )
-    return payload
+    from core.vision import vision
+    tools_ext.reset_state()
+    vision.last_region = None
 
 
 def update_memory(notes: str) -> str:
@@ -585,33 +581,6 @@ def update_memory(notes: str) -> str:
     trạng thái màn hình. Sổ luôn được đính vào lượt mới nhất và không bị lược bỏ như ảnh/kết quả cũ.
     """
     return "Đã ghi nhớ."
-
-
-def desktop_click(ref_id: str) -> str:
-    """
-    Click trực tiếp vào một phần tử giao diện bằng mã @ref ID độc nhất (từ desktop_snapshot).
-    Ví dụ: ref_id='@s8f3k2p9:e8'.
-    Thao tác thực hiện qua API ngữ nghĩa, không di chuyển chuột vật lý của người dùng, chuẩn xác 100%!
-    """
-    res = agent_desktop.click(ref_id, headed=False)
-    if res.get("ok"):
-        return f"Thành công: Đã click vào phần tử '{ref_id}'."
-    # Nếu headless thất bại, thử chế độ headed
-    res_headed = agent_desktop.click(ref_id, headed=True)
-    if res_headed.get("ok"):
-        return f"Thành công (headed): Đã click vào phần tử '{ref_id}'."
-    return f"Thất bại khi click '{ref_id}': {res.get('error') or res_headed.get('error')}"
-
-
-def desktop_type(ref_id: str, text: str) -> str:
-    """
-    Nhập văn bản vào một ô nhập liệu bằng mã @ref ID độc nhất (từ desktop_snapshot).
-    Ví dụ: ref_id='@s8f3k2p9:e3', text='Báo cáo công việc'.
-    """
-    res = agent_desktop.type_text(ref_id, text)
-    if res.get("ok"):
-        return f"Thành công: Đã nhập {len(text)} ký tự vào phần tử '{ref_id}'."
-    return f"Thất bại khi nhập văn bản: {res.get('error')}"
 
 
 def desktop_find(app_name: str, query: str = "", role: str = "") -> str:
@@ -645,32 +614,38 @@ def finish_task(summary: str, is_success: bool = True) -> str:
     return f"[HOÀN THÀNH - {status}]: {summary}"
 
 
-# Danh sách các tools cung cấp cho Gemini
+# Danh sách các tools (đầy đủ). Bộ công cụ thực sự gửi cho AI được chọn động bằng select_tools().
 ALL_TOOLS = [
+    run_powershell,
+    write_text_file,
+    open_app_and_wait,
+    run_actions,
+    read_file_content,
     run_python_code,
+    run_skill,
     list_skills,
     load_skill,
     save_skill,
-    desktop_snapshot,
     update_memory,
+    desktop_snapshot,
     desktop_click,
     desktop_type,
     desktop_find,
     desktop_focus_window,
     take_screenshot_to_see,
+    click_mark,
     mouse_click_coords,
     mouse_double_click,
     mouse_right_click,
     mouse_drag_and_drop,
-    solitaire_move_by_column,
-    solitaire_draw_card,
-    validate_card_move,
     mouse_hover,
     mouse_scroll_page,
     type_vietnamese_text,
     keyboard_shortcut,
-    run_powershell,
-    read_file_content,
+    solitaire_best_move,
+    solitaire_move_by_column,
+    solitaire_draw_card,
+    validate_card_move,
     ui_click,
     ui_type,
     inspect_active_window,
@@ -683,26 +658,67 @@ TOOL_MAP = {func.__name__: func for func in ALL_TOOLS}
 
 
 # ========================================================
+# BỘ CÔNG CỤ ĐỘNG: chỉ gửi cho AI những công cụ cần thiết cho nhiệm vụ (giảm token mỗi bước)
+# ========================================================
+SOLITAIRE_TOOLS = {"solitaire_best_move", "solitaire_move_by_column", "solitaire_draw_card", "validate_card_move"}
+LEGACY_UI_TOOLS = {"ui_click", "ui_type", "inspect_active_window"}
+SKILL_TOOL_GROUPS = {"solitaire_rules": SOLITAIRE_TOOLS}
+_SOLITAIRE_WORDS = ("solitaire", "klondike", "game bai", "xep bai", "choi bai", "patience")
+
+
+def select_tools(goal: str = "", extra: set | None = None) -> list:
+    """
+    Công cụ cốt lõi + chuột luôn có. Nhóm Solitaire chỉ khi mục tiêu liên quan (hoặc đã nạp skill tương ứng).
+    Nhóm UIAutomation cổ điển chỉ khi agent-desktop không khả dụng.
+    """
+    from core.agent_desktop import agent_desktop
+    from core.guard import _norm
+    drop = set(SOLITAIRE_TOOLS) | set(LEGACY_UI_TOOLS)
+    text = _norm(goal or "")
+    if any(w in text for w in _SOLITAIRE_WORDS):
+        drop -= SOLITAIRE_TOOLS
+    if not agent_desktop.is_available():
+        drop -= LEGACY_UI_TOOLS
+    if extra:
+        drop -= set(extra)
+    return [f for f in ALL_TOOLS if f.__name__ not in drop]
+
+
+# ========================================================
 # BỘ ĐIỀU PHỐI CÔNG CỤ DÙNG CHUNG CHO MỌI "BỘ NÃO" (GEMINI / CLAUDE)
 # ========================================================
 
 class ToolOutcome:
-    __slots__ = ("text", "image", "finished", "summary", "success")
+    __slots__ = ("text", "image", "finished", "summary", "success", "tools_added")
 
     def __init__(self, text: str, image: bytes | None = None, finished: bool = False,
-                 summary: str = "", success: bool = True):
+                 summary: str = "", success: bool = True, tools_added: set | None = None):
         self.text = text
         self.image = image
         self.finished = finished
         self.summary = summary
         self.success = success
+        self.tools_added = tools_added or set()
+
+
+def _truthy(v) -> bool:
+    return v if isinstance(v, bool) else str(v).strip().lower() in ("true", "1", "yes")
+
+
+def _window_state_line() -> str:
+    try:
+        return f"\n[Cửa sổ] {controller.get_foreground_window().get('title', '')}"
+    except Exception:
+        return ""
 
 
 def dispatch_tool(fn_name: str, fn_args: dict, max_chars: int = 4000, guard=None) -> ToolOutcome:
     """
     Thực thi 1 lệnh gọi công cụ và chuẩn hóa kết quả (đã cắt gọn) để gửi lại cho AI.
     `guard` (core.guard.RunGuard) bổ sung: sổ nhớ, cổng xác minh khi kết thúc, cảnh báo vòng lặp.
+    Thao tác giao diện tự đính kèm dòng "[Cửa sổ] ..." nên AI không cần gọi riêng để kiểm tra trạng thái.
     """
+    from core.guard import UI_ACTION_TOOLS
     fn_args = dict(fn_args or {})
     if fn_name == "finish_task":
         if guard is not None and fn_args.get("is_success", True):
@@ -721,8 +737,19 @@ def dispatch_tool(fn_name: str, fn_args: dict, max_chars: int = 4000, guard=None
     if fn_name == "take_screenshot_to_see":
         try:
             from core.vision import vision
-            img_bytes, sw, sh = vision.capture_screen_bytes()
-            result = f"Đã chụp màn hình ({sw}x{sh} px), ảnh đính kèm. Tọa độ dùng thang chuẩn hóa 0-1000."
+            marks = tools_ext.capture_marks() if _truthy(fn_args.get("marks")) else None
+            region = None
+            if _truthy(fn_args.get("window")):
+                rect = controller.get_foreground_window().get("rect")
+                if rect:
+                    region = (rect["left"], rect["top"], rect["right"] - rect["left"], rect["bottom"] - rect["top"])
+            img_bytes, sw, sh = vision.capture_screen_bytes(region=region, marks=marks)
+            what = "cửa sổ đang focus" if vision.last_region else "màn hình"
+            result = f"Đã chụp {what} ({sw}x{sh} px), ảnh đính kèm. Tọa độ 0-1000 tính theo ảnh này."
+            if marks:
+                result += f" Số trên ảnh: {tools_ext.marks_legend(marks)}. Dùng click_mark(số)."
+            elif _truthy(fn_args.get("marks")):
+                result += " (Không lấy được phần tử để đánh số.)"
             image = img_bytes
         except Exception as ex:
             result = f"Lỗi chụp ảnh màn hình: {ex}"
@@ -738,8 +765,17 @@ def dispatch_tool(fn_name: str, fn_args: dict, max_chars: int = 4000, guard=None
             result = f"Lỗi khi thực thi công cụ {fn_name}: {ex}"
 
     result = truncate_text(result, max_chars)
+    if fn_name != "run_actions":  # run_actions tự ghi từng bước con
+        recorder.record(fn_name, fn_args, result)
+    if fn_name in UI_ACTION_TOOLS and "[Cửa sổ]" not in result:
+        result += _window_state_line()
+
     if guard is not None:
         hint = guard.observe(fn_name, fn_args, result)
         if hint:
             result = f"{result}\n{hint}"
-    return ToolOutcome(result, image=image)
+
+    added = set()
+    if fn_name == "load_skill":
+        added = set(SKILL_TOOL_GROUPS.get(re.sub(r"\.(md|py)$", "", str(fn_args.get("skill_name", "")).strip()), ()))
+    return ToolOutcome(result, image=image, tools_added=added)

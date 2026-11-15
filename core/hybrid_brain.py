@@ -25,12 +25,17 @@ chụp màn hình + chuột/bàn phím, chạy Python, và kho kỹ năng skills
 CÁCH LÀM:
 1. Chia mục tiêu thành ÍT nhiệm vụ con nhất có thể. Mỗi nhiệm vụ con là một khối việc trọn vẹn executor tự làm được.
    Mục tiêu đơn giản -> giao MỘT lần duy nhất.
-2. delegate_to_executor: chỉ dẫn phải TỰ CHỨA (executor không thấy mục tiêu gốc hay lịch sử): ứng dụng, đường dẫn,
+2. delegate_to_executor: truyền thêm "checks" khi có thể - tiêu chí MÁY tự kiểm chứng (executor không cần chụp ảnh
+   để tự xem): file_exists:<đường dẫn> · file_contains:<đường dẫn>::<chuỗi> · dir_exists:<đường dẫn> ·
+   window_title_contains:<chuỗi> · process_running:<tên>. Chỉ dẫn phải TỰ CHỨA (executor không thấy mục tiêu gốc hay lịch sử): ứng dụng, đường dẫn,
    nội dung chính xác cần gõ/ghi (nếu cần viết nội dung chất lượng, hãy tự soạn sẵn trong chỉ dẫn),
    và tiêu chí hoàn thành kiểm chứng được.
 3. Việc đọc/tóm tắt dữ liệu lớn: giao executor đọc và báo cáo tóm tắt, đừng yêu cầu chép nguyên văn.
 4. Đọc báo cáo. Nếu chưa đạt: chẩn đoán ngắn gọn rồi giao lại với cách tiếp cận KHÁC, không lặp y hệt.
 5. Khi báo cáo cho thấy mục tiêu đã đạt -> finish_task. Nếu không thể đạt sau vài lần thử -> finish_task(is_success=false).
+
+Nếu tin nhắn đầu cho biết executor đã tự thử và chưa đạt: đọc báo cáo, chẩn đoán nguyên nhân rồi giao lại
+với cách tiếp cận cụ thể hơn, không lặp lại cách cũ.
 
 Trả lời cực ngắn, không giải thích dài dòng. Luôn kết thúc lượt bằng một lệnh gọi công cụ.
 """.strip()
@@ -45,6 +50,10 @@ PLANNER_TOOLS = [
                 "instruction": {"type": "string", "description": "Chỉ dẫn tự chứa, cụ thể."},
                 "success_criteria": {"type": "string", "description": "Điều kiện kiểm chứng được để coi là xong."},
                 "max_steps": {"type": "integer", "description": "Số bước tối đa cho executor (mặc định 12)."},
+                "checks": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Tiêu chí máy kiểm chứng, vd ['file_exists:~/Desktop/a.txt', 'file_contains:~/Desktop/a.txt::xin chào'].",
+                },
             },
             "required": ["instruction"],
         },
@@ -79,6 +88,8 @@ def format_report(res: dict, limit: int) -> str:
         lines.append(f"Báo cáo: {res['summary']}")
     if res.get("error") and res.get("error") != res.get("summary"):
         lines.append(f"Lỗi: {res['error']}")
+    if res.get("checks"):
+        lines.append(f"Máy kiểm chứng:\n{res['checks']}")
     if res.get("notes"):
         lines.append(f"Sổ nhớ executor: {res['notes']}")
     if not res.get("success") and res.get("trace"):
@@ -141,7 +152,26 @@ class HybridBrain:
             elif not safety.is_stopped():
                 self.set_status("Chưa hoàn thành")
                 self.log("WARN", error or summary)
-            return {"success": success, "summary": summary, "error": error}
+            return {"success": success, "summary": summary, "error": error, "steps": rounds,
+                    "usage": {"claude": dict(claude_usage), "gemini": dict(gemini_usage)}}
+
+        # ---- Chiến lược "leo thang": Gemini tự thử trước, chỉ gọi Claude khi chưa đạt ----
+        if config.hybrid_strategy == "escalate":
+            self.log("STEP", "=== GEMINI TỰ THỬ TRƯỚC ===")
+            self.set_status("Gemini đang tự thực hiện (chưa gọi Claude)...")
+            first = self.executor.run_subtask(goal, "", config.escalation_steps)
+            for k in gemini_usage:
+                gemini_usage[k] += first.get("usage", {}).get(k, 0)
+            if first.get("stopped"):
+                return done(False, error=first.get("error") or "Đã dừng.")
+            if first.get("api_error"):
+                return done(False, error=f"Gemini (tay chân) không khả dụng: {first.get('error')}")
+            if first.get("success"):
+                self.log("INFO", "Gemini tự hoàn thành, không tốn token Claude.")
+                return done(True, summary=first.get("summary") or "Đã hoàn thành.")
+            report0 = format_report(first, config.report_max_chars)
+            self.log("INFO", "Gemini chưa đạt, chuyển cho Claude lập kế hoạch.")
+            messages[0]["content"] += f"\n\nExecutor (Gemini) đã tự thử làm trực tiếp nhưng CHƯA ĐẠT:\n{report0}"
 
         while rounds < max_rounds:
             if safety.is_stopped():
@@ -169,6 +199,9 @@ class HybridBrain:
             claude_usage["cache_read"] += getattr(u, "cache_read_input_tokens", 0) or 0
             claude_usage["out"] += u.output_tokens or 0
             self.log("INFO", f"📊 Claude: vào {u.input_tokens} · ra {u.output_tokens}")
+            budget = config.max_claude_tokens
+            if budget and (claude_usage["in"] + claude_usage["out"]) > budget:
+                return done(False, error=f"Vượt ngân sách token Claude ({budget}). Dừng để tránh tốn thêm.")
 
             messages.append({"role": "assistant", "content": response.content})
             tool_uses = []
@@ -206,7 +239,9 @@ class HybridBrain:
                 budget = max(1, min(budget, config.executor_max_steps))
 
                 self.log("ACTION", f"⚡ Giao cho Gemini ({budget} bước): {one_line(instruction, 300)}")
-                res = self.executor.run_subtask(instruction, criteria, budget)
+                checks = args.get("checks") or []
+                checks = [str(c) for c in checks] if isinstance(checks, list) else []
+                res = self.executor.run_subtask(instruction, criteria, budget, checks=checks)
                 for k in gemini_usage:
                     gemini_usage[k] += res.get("usage", {}).get(k, 0)
 

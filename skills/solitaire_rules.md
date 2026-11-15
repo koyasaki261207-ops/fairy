@@ -50,3 +50,11 @@ Mỗi khi chụp ảnh màn hình, AI PHẢI duyệt kỹ theo 4 bước sau tro
   - Bốc cả cụm [4♣, 3♥] ở Cột 4 sang 5♦ ở Cột 5 -> `solitaire_move_by_column(from_col=4, to_col=5, source_card='4 Tép', target_card='5 Rô')` (truyền lá GỐC của cụm).
 - `solitaire_draw_card()`: rút bài mới từ Stockpile — chỉ khi đã quét hết mà không còn nước đi hợp lệ.
 - Mẹo tiết kiệm: sau mỗi ảnh chụp, ghi ngắn trạng thái bàn bài (lá ngửa trên cùng của 7 cột, Waste, 4 ô đích) trong suy nghĩ, vì ảnh cũ sẽ bị lược khỏi lịch sử.
+
+## 8. BỘ GIẢI TỰ ĐỘNG (TIẾT KIỆM NHẤT - ƯU TIÊN DÙNG)
+Thay vì tự nghĩ nước đi, đọc bàn bài MỘT lần thành JSON rồi gọi `solitaire_best_move(state)`; code sẽ chấm điểm các nước hợp lệ
+(đưa lên ô đích > lật bài úp > giải phóng cột > đặt K vào cột trống > bài lật > rút bài) và trả về đúng lệnh cần gọi.
+Định dạng `state`:
+`{"tableau":[{"down":3,"up":["K Cơ","Q Bích"]}, ...đủ 7 cột...], "waste":"3 Cơ" hoặc null, "foundations":{"co":0,"ro":0,"bich":0,"tep":0}, "stock":24}`
+- `up`: các lá NGỬA của cột, từ lá ngửa đầu cột đến lá trên cùng. `down`: số lá úp. `foundations`: rank cao nhất đã lên ô đích mỗi chất.
+- Gọi đúng lệnh `Gọi:` mà bộ giải trả về, rồi chụp lại và chỉ cập nhật phần JSON thay đổi.

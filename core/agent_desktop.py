@@ -58,15 +58,33 @@ class AgentDesktopManager:
     def get_status(self) -> dict:
         return self.run_raw(["status"])
 
-    def snapshot(self, app: str = "", interactive_only: bool = True, compact: bool = True) -> dict:
+    def snapshot(self, app: str = "", interactive_only: bool = True, compact: bool = True,
+                 bounds: bool = True) -> dict:
+        """
+        Chụp cây Accessibility. Không chỉ định app -> cửa sổ đang focus (--surface focused).
+        Nếu nhiều cửa sổ cùng khớp (AMBIGUOUS_TARGET) tự chọn cửa sổ đang focus/hiển thị rồi thử lại.
+        """
         args = ["snapshot"]
         if app:
             args.extend(["--app", app])
+        else:
+            args.extend(["--surface", "focused"])
         if interactive_only:
             args.append("-i")
         if compact:
             args.append("--compact")
-        return self.run_raw(args)
+        if bounds:
+            args.append("--include-bounds")
+        res = self.run_raw(args)
+
+        err = res.get("error")
+        if not res.get("ok") and isinstance(err, dict) and err.get("code") == "AMBIGUOUS_TARGET":
+            cands = (err.get("details") or {}).get("candidates") or []
+            pick = next((c for c in cands if c.get("is_focused")), None) \
+                or next((c for c in cands if c.get("visible")), None) or (cands[0] if cands else None)
+            if pick and pick.get("id"):
+                res = self.run_raw(args + ["--window-id", pick["id"]])
+        return res
 
     def find_elements(self, app: str, query: str = "", role: str = "") -> dict:
         args = ["find", "--app", app]

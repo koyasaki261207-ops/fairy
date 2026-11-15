@@ -24,7 +24,7 @@ UI_ACTION_TOOLS = {
     "desktop_click", "desktop_type", "desktop_focus_window", "ui_click", "ui_type",
     "mouse_click_coords", "mouse_double_click", "mouse_right_click", "mouse_drag_and_drop",
     "mouse_scroll_page", "keyboard_shortcut", "type_vietnamese_text",
-    "solitaire_move_by_column", "solitaire_draw_card",
+    "solitaire_move_by_column", "solitaire_draw_card", "run_actions", "click_mark",
 }
 # Công cụ quan sát trạng thái
 OBSERVE_TOOLS = {
@@ -52,7 +52,10 @@ def _signature(name: str, args: dict) -> str:
 
 
 class RunGuard:
-    def __init__(self, window: int = 8):
+    def __init__(self, window: int = 8, checks=None):
+        self.checks = list(checks or [])
+        self.check_bounces = 0
+        self.check_report = ""
         self.recent = deque(maxlen=window)      # (signature, failed)
         self.consec_fail = 0
         self.unverified = False                 # có hành động giao diện chưa quan sát lại
@@ -101,7 +104,22 @@ class RunGuard:
 
     # ---------------- Cổng xác minh trước khi kết thúc ----------------
     def check_finish(self) -> str | None:
-        """Trả về thông điệp từ chối (1 lần duy nhất) nếu chưa xác minh kết quả; None nếu cho phép."""
+        """
+        Trả về thông điệp từ chối nếu chưa xác minh kết quả; None nếu cho phép kết thúc.
+        - Có tiêu chí máy (checks): code tự đối chiếu trạng thái thật; đạt -> cho qua, không cần AI quan sát lại.
+          Không đạt -> trả báo cáo để AI sửa (tối đa 3 lần, sau đó cho qua và ghi lại báo cáo).
+        - Không có checks: bật lại 1 lần nếu hành động giao diện cuối chưa được quan sát lại.
+        """
+        if self.checks:
+            from core.checks import run_checks
+            ok, report = run_checks(self.checks)
+            self.check_report = report
+            if ok:
+                return None
+            self.check_bounces += 1
+            if self.check_bounces <= 3:
+                return "CHƯA ĐẠT TIÊU CHÍ KIỂM CHỨNG (máy đã kiểm tra):\n" + report + "\nHãy sửa rồi gọi lại finish_task."
+            return None
         if self.unverified and not self.finish_bounced:
             self.finish_bounced = True
             return (
@@ -146,7 +164,7 @@ def suggest_skills(goal: str, skills_dir: Path = SKILLS_DIR, limit: int = 2) -> 
         return []
     goal_tokens = _tokens(goal)
     scored = []
-    for f in Path(skills_dir).glob("*.md"):
+    for f in sorted(Path(skills_dir).glob("*.md")) + sorted(Path(skills_dir).glob("*.py")):
         try:
             head = f.read_text(encoding="utf-8", errors="replace")[:1500]
         except Exception:
@@ -164,5 +182,8 @@ def skill_hint(goal: str) -> str:
     names = suggest_skills(goal)
     if not names:
         return ""
-    joined = ", ".join(f"'{n}'" for n in names)
-    return f"- Kỹ năng liên quan có sẵn: {joined}. Hãy gọi load_skill trước khi bắt đầu.\n"
+    parts = []
+    for n in names:
+        runnable = (SKILLS_DIR / f"{n}.py").exists()
+        parts.append(f"run_skill('{n}', '<json>')" if runnable else f"load_skill('{n}')")
+    return "- Kỹ năng liên quan có sẵn: " + ", ".join(parts) + ". Hãy dùng trước khi bắt đầu.\n"

@@ -36,3 +36,7 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# Dữ liệu cục bộ sinh ra khi chạy (recipes, nhật ký chạy)
+memory/
+logs/*.jsonl

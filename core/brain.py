@@ -19,7 +19,7 @@ from config import config
 from core.safety import safety
 from core.controller import controller
 from core.vision import vision
-from core.tools import ALL_TOOLS, dispatch_tool, reset_run_state
+from core.tools import ALL_TOOLS, dispatch_tool, reset_run_state, select_tools
 from core.guard import RunGuard, skill_hint
 from core.prompts import SYSTEM_INSTRUCTION  # noqa: F401  (giữ để tương thích import cũ)
 from core.context import (
@@ -38,6 +38,8 @@ FALLBACK_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
 ]
+
+_THINKING_LEVELS = {"minimal": "MINIMAL", "low": "LOW", "medium": "MEDIUM", "high": "HIGH"}
 
 _MEDIA_RESOLUTION = {
     "low": "MEDIA_RESOLUTION_LOW",
@@ -120,6 +122,7 @@ class GeminiBrain:
         self.status_callback = status_callback or (lambda st: None)
         self.client = None
         self.key_index = 0
+        self._thinking_ok = True
 
     def _init_client(self):
         """Khởi tạo Google GenAI Client với API Key hiện tại"""
@@ -129,7 +132,9 @@ class GeminiBrain:
                 "Chưa cấu hình GEMINI_API_KEY! Hãy nhập API Key trong phần Cài Đặt hoặc file .env."
             )
         active_key = keys[self.key_index % len(keys)]
-        self.client = genai.Client(api_key=active_key)
+        if self.client is None or getattr(self, "_client_key", None) != active_key:
+            self.client = genai.Client(api_key=active_key)   # dùng lại client giữa các nhiệm vụ con
+            self._client_key = active_key
         return active_key
 
     def rotate_key(self) -> bool:
@@ -138,6 +143,7 @@ class GeminiBrain:
         if len(keys) > 1:
             self.key_index = (self.key_index + 1) % len(keys)
             self.client = genai.Client(api_key=keys[self.key_index])
+            self._client_key = keys[self.key_index]
             self.log("INFO", f"🔄 Tự động chuyển sang API Key dự phòng #{self.key_index + 1}...")
             return True
         return False
@@ -150,19 +156,22 @@ class GeminiBrain:
         if self.status_callback:
             self.status_callback(status)
 
-    def _build_config(self) -> types.GenerateContentConfig:
+    def _build_config(self, tools=None) -> types.GenerateContentConfig:
         kwargs = dict(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.2,
-            tools=ALL_TOOLS,
+            tools=tools if tools is not None else ALL_TOOLS,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
         media_res = _MEDIA_RESOLUTION.get(config.gemini_media_resolution)
         if media_res:
             kwargs["media_resolution"] = media_res
+        level = _THINKING_LEVELS.get(config.gemini_thinking_level)
+        if level and self._thinking_ok:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=level)
         return types.GenerateContentConfig(**kwargs)
 
-    def _generate(self, contents, gen_config, models):
+    def _generate(self, contents, tools, models):
         """
         Gọi API với chiến lược dự phòng:
         - 429/quota: xoay API key (tối đa số key), rồi mới chuyển model.
@@ -178,13 +187,19 @@ class GeminiBrain:
                 if safety.is_stopped():
                     return None, None, safety.get_stop_reason()
                 try:
-                    resp = self.client.models.generate_content(model=model, contents=contents, config=gen_config)
+                    resp = self.client.models.generate_content(
+                        model=model, contents=contents, config=self._build_config(tools))
                     return model, resp, ""
                 except Exception as e:
                     kind = _classify_error(e)
                     last_err = str(e)
                     if kind == "fatal":
                         raise
+                    if self._thinking_ok and "thinking" in last_err.lower():
+                        # Mô hình không hỗ trợ mức suy nghĩ -> tắt tùy chọn và thử lại cùng mô hình
+                        self._thinking_ok = False
+                        self.log("INFO", "Mô hình không hỗ trợ GEMINI_THINKING_LEVEL, bỏ qua tùy chọn này.")
+                        continue
                     if kind == "quota" and rotations < n_keys - 1 and self.rotate_key():
                         rotations += 1
                         continue
@@ -211,7 +226,7 @@ class GeminiBrain:
             f"{skill_hint(goal)}"
             f"Hãy bắt đầu suy nghĩ và gọi các công cụ phù hợp nhất để hoàn thành mục tiêu."
         )
-        result = self._run_loop(context, config.max_steps, standalone=True)
+        result = self._run_loop(context, config.max_steps, standalone=True, goal=goal)
         if result.get("success"):
             self.set_status("Hoàn thành xuất sắc!")
             self.log("SUCCESS", f"🎉 {result['summary']}")
@@ -219,7 +234,7 @@ class GeminiBrain:
             self.log("WARN", result.get("error") or result.get("summary") or "Chưa hoàn thành.")
         return result
 
-    def run_subtask(self, instruction: str, success_criteria: str = "", max_steps: int = 15) -> dict:
+    def run_subtask(self, instruction: str, success_criteria: str = "", max_steps: int = 15, checks=None) -> dict:
         """
         Chế độ "tay chân": thực hiện 1 nhiệm vụ con do bộ não điều phối (Claude) giao,
         rồi trả về báo cáo ngắn gọn. Không reset trạng thái dừng khẩn cấp của lượt chạy cha.
@@ -233,7 +248,7 @@ class GeminiBrain:
             "summary nêu RÕ và NGẮN: đã làm gì, kết quả đã kiểm chứng thực tế, và mọi dữ liệu bộ não cần "
             "(đường dẫn, giá trị, nội dung đọc được, lỗi gặp phải). is_success=False nếu chưa đạt tiêu chí."
         )
-        return self._run_loop(context, max(1, max_steps), standalone=False)
+        return self._run_loop(context, max(1, max_steps), standalone=False, goal=instruction, checks=checks)
 
     # =================================================================
     # VÒNG LẶP REACT DÙNG CHUNG
@@ -247,13 +262,13 @@ class GeminiBrain:
             f"- Kích thước màn hình: {screen_w} x {screen_h} pixels.\n"
         )
 
-    def _run_loop(self, initial_context: str, max_steps: int, standalone: bool) -> dict:
+    def _run_loop(self, initial_context: str, max_steps: int, standalone: bool, goal: str = "", checks=None) -> dict:
         """
         Trả về dict: success, summary, error, steps, usage, trace (vài thao tác cuối), notes, stopped.
         """
         usage_total = {"in": 0, "cached": 0, "out": 0}
         trace = deque(maxlen=6)
-        guard = RunGuard()
+        guard = RunGuard(checks=checks)
 
         def result(success: bool, summary: str = "", error: str = "", stopped: bool = False, steps: int = 0,
                    api_error: bool = False):
@@ -264,7 +279,7 @@ class GeminiBrain:
             return {
                 "success": success, "summary": summary, "error": error, "stopped": stopped,
                 "steps": steps, "usage": dict(usage_total), "trace": list(trace), "notes": guard.notes,
-                "api_error": api_error,
+                "api_error": api_error, "checks": guard.check_report,
             }
 
         try:
@@ -274,7 +289,8 @@ class GeminiBrain:
             self.set_status("Lỗi API Key")
             return result(False, error=str(e), api_error=True)
 
-        gen_config = self._build_config()
+        extra_tools: set = set()
+        active_tools = select_tools(goal, extra_tools)
         reset_run_state()
 
         # Mô hình người dùng chọn luôn được ưu tiên đầu tiên (kể cả khi không nằm trong danh sách dự phòng)
@@ -310,7 +326,7 @@ class GeminiBrain:
 
             candidate_list = [current_model] + [m for m in fallback_models if m != current_model]
             try:
-                used_model, response, err = self._generate(contents, gen_config, candidate_list)
+                used_model, response, err = self._generate(contents, active_tools, candidate_list)
             except Exception as e:
                 self.log("ERROR", f"Lỗi xác thực Gemini API: {e}")
                 self.set_status("Lỗi API Key")
@@ -371,6 +387,9 @@ class GeminiBrain:
                 self.set_status(f"Gemini thực thi: {fn_name}")
 
                 outcome = dispatch_tool(fn_name, fn_args, config.max_tool_result_chars, guard=guard)
+                if outcome.tools_added and not outcome.tools_added <= extra_tools:
+                    extra_tools |= outcome.tools_added
+                    active_tools = select_tools(goal, extra_tools)
                 if outcome.finished:
                     finished = outcome
                 if outcome.image:

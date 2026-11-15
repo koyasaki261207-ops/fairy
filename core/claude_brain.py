@@ -249,13 +249,13 @@ class ClaudeBrain:
         if task_finished and not final_success:
             self.set_status("Chưa hoàn thành")
             self.log("WARN", final_summary)
-            return {"success": False, "summary": final_summary, "error": final_summary}
+            return {"success": False, "summary": final_summary, "error": final_summary, "steps": step, "usage": usage_total}
         if task_finished:
             self.set_status("Hoàn thành xuất sắc!")
             self.log("SUCCESS", f"🎉 {final_summary}")
-            return {"success": True, "summary": final_summary}
+            return {"success": True, "summary": final_summary, "steps": step, "usage": usage_total}
 
         self.set_status("Hết số bước tối đa")
         msg = f"Đã đạt giới hạn {max_steps} bước nhưng chưa hoàn thành toàn bộ."
         self.log("WARN", msg)
-        return {"success": False, "error": msg}
+        return {"success": False, "error": msg, "steps": step, "usage": usage_total}

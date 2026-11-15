@@ -21,14 +21,12 @@ CLI_ICONS = {
 
 
 def _make_brain(provider: str, logger):
-    if provider == "hybrid":
-        from core.hybrid_brain import HybridBrain
-        return HybridBrain(log_callback=logger), f"Claude {config.claude_model} + Gemini {config.gemini_model}"
-    if provider == "claude":
-        from core.claude_brain import ClaudeBrain
-        return ClaudeBrain(log_callback=logger), config.claude_model
-    from core.brain import GeminiBrain
-    return GeminiBrain(log_callback=logger), config.gemini_model
+    from core.factory import make_brain
+    labels = {
+        "hybrid": f"Claude {config.claude_model} + Gemini {config.gemini_model}",
+        "claude": config.claude_model,
+    }
+    return make_brain(provider, log_callback=logger), labels.get(provider, config.gemini_model)
 
 
 def run_cli(goal: str, provider: str):

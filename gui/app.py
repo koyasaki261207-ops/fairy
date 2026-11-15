@@ -128,6 +128,8 @@ class GeminiAutoPilotApp(ctk.CTk):
         # Não bộ Gemini & Claude được nạp lười (lazy) khi cần -> khởi động nhanh,
         # và không bắt buộc cài SDK của provider không dùng tới.
         self._brains = {}
+        # Nạp sẵn SDK ở luồng nền để lần bấm "Bắt đầu" đầu tiên không bị khựng
+        threading.Thread(target=self._preload_sdks, daemon=True).start()
 
         # Đăng ký callback dừng khẩn cấp từ safety
         safety.register_stop_callback(self._on_safety_stop)
@@ -472,16 +474,20 @@ class GeminiAutoPilotApp(ctk.CTk):
     # =================================================================
     # ĐIỀU PHỐI NHIỆM VỤ
     # =================================================================
+    @staticmethod
+    def _preload_sdks():
+        for mod in ("google.genai", "anthropic", "pypdf", "docx"):
+            try:
+                __import__(mod)
+            except Exception:
+                pass
+
     def _get_brain(self, provider: str):
         """Nạp và cache bộ não theo provider ('gemini' | 'claude' | 'hybrid')."""
         if provider not in self._brains:
-            if provider == "hybrid":
-                from core.hybrid_brain import HybridBrain as BrainCls
-            elif provider == "claude":
-                from core.claude_brain import ClaudeBrain as BrainCls
-            else:
-                from core.brain import GeminiBrain as BrainCls
-            self._brains[provider] = BrainCls(
+            from core.factory import make_brain   # bọc Router -> Recipe -> AI
+            self._brains[provider] = make_brain(
+                provider,
                 log_callback=self._enqueue_log,
                 status_callback=self._enqueue_status
             )

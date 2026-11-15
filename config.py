@@ -75,6 +75,20 @@ class Config:
         self.planner_max_tokens = max(256, _env_int("PLANNER_MAX_TOKENS", 1024))  # token đầu ra mỗi lượt Claude
         self.executor_max_steps = max(1, _env_int("EXECUTOR_MAX_STEPS", 15))     # bước tối đa mỗi nhiệm vụ con
         self.report_max_chars = max(300, _env_int("REPORT_MAX_CHARS", 1500))     # độ dài báo cáo gửi Claude
+        # Chiến lược hybrid: "escalate" = Gemini thử trước, chỉ gọi Claude khi chưa đạt (rẻ nhất);
+        # "plan" = luôn để Claude lập kế hoạch từ đầu.
+        self.hybrid_strategy = os.getenv("HYBRID_STRATEGY", "escalate").strip().lower()
+        self.escalation_steps = max(1, _env_int("ESCALATION_STEPS", 12))         # bước Gemini tự thử trước khi leo thang
+        self.max_claude_tokens = max(0, _env_int("MAX_CLAUDE_TOKENS", 60000))     # ngân sách token Claude mỗi nhiệm vụ (0 = không giới hạn)
+
+        # ---- Tốc độ & logic cục bộ ----
+        self.persistent_shell = _env_bool("PERSISTENT_SHELL", True)   # giữ sống 1 phiên PowerShell
+        self.adaptive_wait = _env_bool("ADAPTIVE_WAIT", True)         # chờ theo trạng thái cửa sổ thay vì sleep cố định
+        self.router_enabled = _env_bool("ROUTER", True)               # xử lý lệnh quen thuộc không cần AI
+        self.recipes_enabled = _env_bool("RECIPES", True)             # lưu & chạy lại cách làm đã thành công
+        self.runlog_enabled = _env_bool("RUNLOG", True)               # ghi logs/runs.jsonl
+        # Mức suy nghĩ của Gemini: "", minimal, low, medium, high (thấp = ít token đầu ra, nhanh hơn)
+        self.gemini_thinking_level = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
         # Độ phân giải ảnh Gemini: "" (mặc định API), "low", "medium", "high"
         self.gemini_media_resolution = os.getenv("GEMINI_MEDIA_RESOLUTION", "").strip().lower()
 

@@ -11,6 +11,7 @@ import win32process
 import pyautogui
 import pyperclip
 from core.safety import safety
+from core.shell import shell
 from config import config
 
 # Thiết lập pyautogui an toàn
@@ -20,7 +21,63 @@ pyautogui.FAILSAFE = True
 
 class SystemController:
     def __init__(self):
-        pass
+        self._last_sig = None
+
+    # ----------------------------------------------------
+    # CHỜ THÍCH ỨNG (thay cho sleep cố định sau mỗi thao tác)
+    # ----------------------------------------------------
+    def _window_sig(self):
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+            return hwnd, win32gui.GetWindowText(hwnd)
+        except Exception:
+            return None
+
+    def settle(self, kind: str = "click", before=None):
+        """
+        Chờ giao diện ổn định sau thao tác.
+        - 'click'/'key': chờ tối thiểu ngắn; nếu cửa sổ đổi (mở hộp thoại/ứng dụng) thì chờ thêm
+          tới khi ổn định (tối đa ~1.5s). Nếu không đổi thì quay lại ngay.
+        - 'type'/'move': chỉ đợi rất ngắn.
+        Tắt bằng ADAPTIVE_WAIT=false -> dùng độ trễ cố định ACTION_DELAY như cũ.
+        """
+        if not config.adaptive_wait:
+            time.sleep(config.action_delay)
+            return
+        floor = {"click": 0.12, "key": 0.10, "type": 0.06, "move": 0.03, "drag": 0.10}.get(kind, 0.1)
+        floor = min(floor, config.action_delay) if config.action_delay > 0 else 0
+        time.sleep(floor)
+        if kind not in ("click", "key", "drag"):
+            return
+        before = before if before is not None else self._last_sig
+        deadline = time.time() + 1.5
+        # Cửa sổ chưa đổi sau một nhịp ngắn -> coi như xong
+        if self._window_sig() == before:
+            time.sleep(min(0.15, config.action_delay))
+            if self._window_sig() == before:
+                return
+        # Cửa sổ đã đổi -> chờ tới khi chữ ký ổn định 2 lần liên tiếp
+        last = None
+        while time.time() < deadline:
+            cur = self._window_sig()
+            if cur == last:
+                break
+            last = cur
+            time.sleep(0.08)
+        self._last_sig = self._window_sig()
+
+    def wait_for_window(self, keyword: str, timeout: float = 8.0) -> dict | None:
+        """Chờ tới khi có cửa sổ hiển thị có tiêu đề chứa keyword (trả về thông tin cửa sổ hoặc None)."""
+        kw = keyword.lower()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if safety.is_stopped():
+                return None
+            for w in self.list_visible_windows():
+                if kw in w["title"].lower():
+                    return w
+            time.sleep(0.1)
+        return None
 
     # ----------------------------------------------------
     # TẦNG 1: THỰC THI HỆ THỐNG SIÊU TỐC (POWERSHELL / CLI)
@@ -37,6 +94,14 @@ class SystemController:
             is_safe, reason = safety.check_command_safety(command)
             if not is_safe:
                 return {"success": False, "error": reason}
+
+        if config.persistent_shell:
+            res = shell.run(command, timeout=timeout)
+            if "error" not in res or "timeout" in res.get("error", ""):
+                if res.get("stdout") and len(res["stdout"]) > 2500:
+                    res["stdout"] = res["stdout"][:2500] + "\n...[Nội dung còn lại đã được cắt ngắn]"
+                return res
+            # Phiên giữ sống lỗi (không phải timeout) -> rơi về cách chạy tiến trình riêng bên dưới
 
         try:
             # Dùng powershell.exe chạy lệnh
@@ -140,7 +205,7 @@ class SystemController:
         try:
             pyautogui.moveTo(x, y, duration=0.15)
             pyautogui.click(x=x, y=y, button=button, clicks=clicks)
-            time.sleep(config.action_delay)
+            self.settle("click")
             return True
         except pyautogui.FailSafeException:
             safety.stop("Kích hoạt FailSafe do di chuột vào góc màn hình!")
@@ -155,7 +220,7 @@ class SystemController:
         try:
             pyautogui.moveTo(x, y, duration=0.15)
             pyautogui.doubleClick(x=x, y=y)
-            time.sleep(config.action_delay)
+            self.settle("click")
             return True
         except pyautogui.FailSafeException:
             safety.stop("Kích hoạt FailSafe do di chuột vào góc màn hình!")
@@ -170,7 +235,7 @@ class SystemController:
         try:
             pyautogui.moveTo(x, y, duration=0.15)
             pyautogui.rightClick(x=x, y=y)
-            time.sleep(config.action_delay)
+            self.settle("click")
             return True
         except pyautogui.FailSafeException:
             safety.stop("Kích hoạt FailSafe do di chuột vào góc màn hình!")
@@ -208,7 +273,7 @@ class SystemController:
 
             # 3. Click tại đích để kích hoạt cơ chế Tap-to-Move (trong trường hợp game chỉ nhận click-click)
             pyautogui.click(end_x, end_y)
-            time.sleep(config.action_delay)
+            self.settle("drag")
             return True
         except pyautogui.FailSafeException:
             safety.stop("Kích hoạt FailSafe do di chuột vào góc màn hình!")
@@ -222,7 +287,7 @@ class SystemController:
             return False
         try:
             pyautogui.scroll(clicks)
-            time.sleep(config.action_delay)
+            self.settle("type")
             return True
         except Exception:
             return False
@@ -249,7 +314,7 @@ class SystemController:
                 time.sleep(0.05)
             else:
                 pyautogui.write(text, interval=0.02)
-            time.sleep(config.action_delay)
+            self.settle("type")
             return True
         except Exception:
             return False
@@ -260,7 +325,7 @@ class SystemController:
             return False
         try:
             pyautogui.press(key)
-            time.sleep(config.action_delay)
+            self.settle("key")
             return True
         except Exception:
             return False
@@ -271,7 +336,7 @@ class SystemController:
             return False
         try:
             pyautogui.hotkey(*keys)
-            time.sleep(config.action_delay)
+            self.settle("key")
             return True
         except Exception:
             return False

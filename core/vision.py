@@ -24,6 +24,7 @@ SCREENSHOTS_DIR = Path(__file__).resolve().parent.parent / "logs" / "screenshots
 class VisionManager:
     def __init__(self):
         self._sct = None
+        self.last_region = None
         self.screen_width, self.screen_height = pyautogui.size()
 
     def get_screen_size(self) -> tuple[int, int]:
@@ -72,16 +73,34 @@ class VisionManager:
             save_path = None
         return pil_img, save_path
 
-    def capture_screen_bytes(self, max_dimension: int | None = None, quality: int | None = None) -> tuple[bytes, int, int]:
+    def capture_screen_bytes(self, max_dimension: int | None = None, quality: int | None = None,
+                             region: tuple | None = None, marks: list | None = None) -> tuple[bytes, int, int]:
         """
-        Chụp màn hình và trả về JPEG đã THU NHỎ (cạnh dài <= max_dimension) để gửi lên AI,
-        kèm kích thước thực của màn hình. Ảnh nhỏ hơn = ít token hơn + upload nhanh hơn.
-        Tọa độ dùng thang chuẩn hóa 0-1000 nên việc thu nhỏ không làm lệch thao tác chuột.
+        Chụp màn hình và trả về JPEG đã THU NHỎ (cạnh dài <= max_dimension) để gửi lên AI.
+        - region=(left, top, w, h): chỉ chụp vùng đó (vd cửa sổ đang focus) -> ảnh nhỏ & rõ hơn.
+          Vùng đã dùng được lưu ở self.last_region để quy đổi tọa độ chuẩn hóa 0-1000 về pixel màn hình.
+        - marks: danh sách phần tử (x, y, w, h, n) để vẽ khung + số lên ảnh (Set-of-Mark).
+        Trả về (bytes, rộng_ảnh, cao_ảnh) của ảnh gửi đi.
         """
         max_dimension = max_dimension or config.screenshot_max_dim
         quality = quality or config.screenshot_quality
-        w, h = self.get_screen_size()
-        img = self._downscale(self._grab(), max_dimension)
+        self.get_screen_size()
+        img = self._grab()
+
+        if marks:
+            img = self.draw_marks(img, marks)
+
+        self.last_region = None
+        if region:
+            iw, ih = img.size
+            left, top, rw, rh = region
+            left, top = max(0, int(left)), max(0, int(top))
+            right, bottom = min(iw, int(left + rw)), min(ih, int(top + rh))
+            if right - left > 50 and bottom - top > 50:
+                img = img.crop((left, top, right, bottom))
+                self.last_region = (left, top, right - left, bottom - top)
+
+        img = self._downscale(img, max_dimension)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         data = buf.getvalue()
@@ -92,7 +111,30 @@ class VisionManager:
                 (SCREENSHOTS_DIR / f"screen_{time.strftime('%Y%m%d_%H%M%S')}.jpg").write_bytes(data)
             except Exception:
                 pass
-        return data, w, h
+        return data, img.size[0], img.size[1]
+
+    @staticmethod
+    def draw_marks(image: Image.Image, marks: list) -> Image.Image:
+        """Vẽ khung viền + nhãn số lên từng phần tử (tọa độ pixel màn hình)."""
+        from PIL import ImageFont
+        img = image.copy()
+        draw = ImageDraw.Draw(img)
+        size = max(14, img.size[0] // 110)
+        try:
+            font = ImageFont.truetype("arial.ttf", size)
+        except Exception:
+            font = ImageFont.load_default()
+        palette = ["#e6194b", "#3cb44b", "#0082c8", "#f58231", "#911eb4", "#008080"]
+        for m in marks:
+            x, y, w, h, n = m["x"], m["y"], m["w"], m["h"], m["n"]
+            color = palette[n % len(palette)]
+            draw.rectangle((x, y, x + w, y + h), outline=color, width=2)
+            label = str(n)
+            tw = draw.textlength(label, font=font)
+            bx0, by0 = max(0, x), max(0, y - size - 4)
+            draw.rectangle((bx0, by0, bx0 + tw + 6, by0 + size + 4), fill=color)
+            draw.text((bx0 + 3, by0 + 1), label, fill="white", font=font)
+        return img
 
     def denormalize_coordinates(self, x_norm: float, y_norm: float) -> tuple[int, int]:
         """
