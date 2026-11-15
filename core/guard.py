@@ -175,15 +175,33 @@ def suggest_skills(goal: str, skills_dir: Path = SKILLS_DIR, limit: int = 2) -> 
         if score:
             scored.append((score, f.stem))
     scored.sort(key=lambda x: (-x[0], x[1]))
-    return [name for _, name in scored[:limit]]
+    if not scored:
+        return []
+    top = scored[0][0]
+    # Bỏ khớp yếu (1 từ chung chung như "chơi") khi đã có kỹ năng khớp mạnh hơn
+    return [name for s, name in scored if s >= top or s >= 2][:limit]
+
+
+def _quick_tip(name: str) -> str:
+    """Dòng 'Gợi ý nhanh:' trong skill .md -> chèn thẳng vào ngữ cảnh, khỏi tốn 1 lượt load_skill."""
+    try:
+        for ln in (SKILLS_DIR / f"{name}.md").read_text(encoding="utf-8", errors="replace").splitlines()[:30]:
+            if _norm(ln).lstrip("*-# ").startswith("goi y nhanh"):
+                return ln.split(":", 1)[-1].strip()
+    except Exception:
+        pass
+    return ""
 
 
 def skill_hint(goal: str) -> str:
     names = suggest_skills(goal)
     if not names:
         return ""
-    parts = []
+    parts, tips = [], []
     for n in names:
         runnable = (SKILLS_DIR / f"{n}.py").exists()
         parts.append(f"run_skill('{n}', '<json>')" if runnable else f"load_skill('{n}')")
-    return "- Kỹ năng liên quan có sẵn: " + ", ".join(parts) + ". Hãy dùng trước khi bắt đầu.\n"
+        tip = "" if runnable else _quick_tip(n)
+        if tip:
+            tips.append(f"- Cách làm nhanh ({n}): {tip}\n")
+    return "- Kỹ năng liên quan có sẵn: " + ", ".join(parts) + ". Hãy dùng trước khi bắt đầu.\n" + "".join(tips)

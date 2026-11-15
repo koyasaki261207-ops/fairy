@@ -31,6 +31,8 @@ CÁCH LÀM:
    nội dung chính xác cần gõ/ghi (nếu cần viết nội dung chất lượng, hãy tự soạn sẵn trong chỉ dẫn),
    và tiêu chí hoàn thành kiểm chứng được.
 3. Việc đọc/tóm tắt dữ liệu lớn: giao executor đọc và báo cáo tóm tắt, đừng yêu cầu chép nguyên văn.
+   Cờ vua: executor có chess_play tự chơi cả ván bằng code -> giao MỘT việc "mở/bắt đầu ván rồi gọi chess_play",
+   tuyệt đối không giao từng nước đi.
 4. Đọc báo cáo. Nếu chưa đạt: chẩn đoán ngắn gọn rồi giao lại với cách tiếp cận KHÁC, không lặp y hệt.
 5. Khi báo cáo cho thấy mục tiêu đã đạt -> finish_task. Nếu không thể đạt sau vài lần thử -> finish_task(is_success=false).
 
@@ -128,6 +130,7 @@ class HybridBrain:
             self.set_status("Thiếu API Key")
             return {"success": False, "error": missing}
         self.client = anthropic.Anthropic(api_key=config.anthropic_api_key, max_retries=4)
+        self.executor.begin_task()   # ngân sách Gemini dùng chung cho mọi nhiệm vụ con của mục tiêu này
 
         model = config.claude_model or "claude-sonnet-5-5"
         self.log("INFO", f"Chế độ kết hợp: Claude ({model}) lập kế hoạch · Gemini ({config.gemini_model}) thực thi.")

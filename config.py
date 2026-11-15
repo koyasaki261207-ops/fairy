@@ -63,9 +63,17 @@ class Config:
         # Độ dài tối đa (ký tự) của mỗi kết quả công cụ gửi lên API
         self.max_tool_result_chars = max(500, _env_int("MAX_TOOL_RESULT_CHARS", 4000))
         # Khi tổng lịch sử vượt ngưỡng này (ký tự), các kết quả công cụ cũ bị nén lại
-        self.history_compact_chars = max(10000, _env_int("HISTORY_COMPACT_CHARS", 60000))
+        self.history_compact_chars = max(8000, _env_int("HISTORY_COMPACT_CHARS", 24000))
         # Giới hạn token đầu ra mỗi lượt suy luận
         self.max_output_tokens = max(256, _env_int("MAX_OUTPUT_TOKENS", 2048))
+        # ---- Ngân sách & ngắt mạch Gemini (chống "đốt sạch" hạn ngạch) ----
+        # Token đầu ra tối đa mỗi lượt Gemini (bao gồm phần suy nghĩ)
+        self.gemini_max_output_tokens = max(512, _env_int("GEMINI_MAX_OUTPUT_TOKENS", 3072))
+        # Tổng số lượt gọi / tổng token Gemini cho MỘT nhiệm vụ (cộng dồn mọi nhiệm vụ con). 0 = không giới hạn
+        self.gemini_max_calls = max(0, _env_int("GEMINI_MAX_CALLS", 40))
+        self.gemini_max_tokens = max(0, _env_int("GEMINI_MAX_TOKENS", 400000))
+        # Hết hạn ngạch ngày ở mô hình chính -> có tự chuyển sang mô hình dự phòng không
+        self.gemini_model_fallback = _env_bool("GEMINI_MODEL_FALLBACK", True)
         # Ảnh chụp màn hình: cạnh dài tối đa, chất lượng JPEG, có lưu ra đĩa hay không
         self.screenshot_max_dim = max(640, _env_int("SCREENSHOT_MAX_DIM", 1280))
         self.screenshot_quality = min(95, max(30, _env_int("SCREENSHOT_QUALITY", 70)))

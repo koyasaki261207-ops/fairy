@@ -15,6 +15,7 @@ from core.tools_ext import (
     run_skill, click_mark, solitaire_best_move,
 )
 from core.recorder import recorder
+from core.chess_play import chess_play
 
 
 def run_powershell(command: str) -> str:
@@ -646,6 +647,7 @@ ALL_TOOLS = [
     solitaire_move_by_column,
     solitaire_draw_card,
     validate_card_move,
+    chess_play,
     ui_click,
     ui_type,
     inspect_active_window,
@@ -661,22 +663,55 @@ TOOL_MAP = {func.__name__: func for func in ALL_TOOLS}
 # BỘ CÔNG CỤ ĐỘNG: chỉ gửi cho AI những công cụ cần thiết cho nhiệm vụ (giảm token mỗi bước)
 # ========================================================
 SOLITAIRE_TOOLS = {"solitaire_best_move", "solitaire_move_by_column", "solitaire_draw_card", "validate_card_move"}
+CHESS_TOOLS = {"chess_play"}
 LEGACY_UI_TOOLS = {"ui_click", "ui_type", "inspect_active_window"}
-SKILL_TOOL_GROUPS = {"solitaire_rules": SOLITAIRE_TOOLS}
+# Hiếm khi cần -> không gửi schema ở mọi request (vẫn gọi được nếu AI tự nêu tên)
+RARE_TOOLS = {"save_skill", "desktop_find", "mouse_hover"}
+SKILL_TOOL_GROUPS = {"solitaire_rules": SOLITAIRE_TOOLS, "chess_play": CHESS_TOOLS}
 _SOLITAIRE_WORDS = ("solitaire", "klondike", "game bai", "xep bai", "choi bai", "patience")
+_CHESS_WORDS = ("chess", "co vua", "lichess", "stockfish")
+_PLAY_WORDS = ("choi", "danh", "play", "van co", "nuoc di", "thi dau", "dau voi", "dau may")
+_FILE_WORDS = ("pgn", "file", "tep", "tai lieu", "doc ", "phan tich", "giai thich")
+_SKILL_WORDS = ("ky nang", "skill")
+# Nhiệm vụ chơi cờ trên màn hình: chỉ cần mở trang/bắt đầu ván rồi giao cho chess_play -> bộ công cụ tối giản
+CHESS_TOOLSET = {
+    "open_app_and_wait", "run_actions", "desktop_snapshot", "desktop_click", "desktop_focus_window",
+    "take_screenshot_to_see", "click_mark", "mouse_click_coords", "keyboard_shortcut", "type_vietnamese_text",
+    "wait_seconds", "update_memory", "load_skill", "chess_play", "finish_task",
+}
+
+
+def is_chess_goal(goal: str) -> bool:
+    """Có nhắc tới cờ vua (để bật chess_play)."""
+    from core.guard import _norm
+    return any(w in _norm(goal or "") for w in _CHESS_WORDS)
+
+
+def is_chess_play_goal(goal: str) -> bool:
+    """Chơi cờ trên màn hình (không phải đọc/phân tích tệp PGN...) -> dùng bộ công cụ tối giản."""
+    from core.guard import _norm
+    text = _norm(goal or "")
+    return is_chess_goal(goal) and any(w in text for w in _PLAY_WORDS) and not any(w in text for w in _FILE_WORDS)
 
 
 def select_tools(goal: str = "", extra: set | None = None) -> list:
     """
-    Công cụ cốt lõi + chuột luôn có. Nhóm Solitaire chỉ khi mục tiêu liên quan (hoặc đã nạp skill tương ứng).
+    Công cụ cốt lõi + chuột luôn có. Nhóm Solitaire/Cờ vua chỉ khi mục tiêu liên quan (hoặc đã nạp skill tương ứng).
     Nhóm UIAutomation cổ điển chỉ khi agent-desktop không khả dụng.
     """
     from core.agent_desktop import agent_desktop
     from core.guard import _norm
-    drop = set(SOLITAIRE_TOOLS) | set(LEGACY_UI_TOOLS)
     text = _norm(goal or "")
+    if is_chess_play_goal(goal):
+        keep = set(CHESS_TOOLSET) | set(extra or ())
+        return [f for f in ALL_TOOLS if f.__name__ in keep]
+    drop = set(SOLITAIRE_TOOLS) | set(LEGACY_UI_TOOLS) | set(CHESS_TOOLS) | set(RARE_TOOLS)
+    if is_chess_goal(goal):
+        drop -= CHESS_TOOLS
     if any(w in text for w in _SOLITAIRE_WORDS):
         drop -= SOLITAIRE_TOOLS
+    if any(w in text for w in _SKILL_WORDS):
+        drop -= RARE_TOOLS
     if not agent_desktop.is_available():
         drop -= LEGACY_UI_TOOLS
     if extra:

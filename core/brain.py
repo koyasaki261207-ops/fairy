@@ -9,6 +9,7 @@ Tối ưu token:
 - Chỉ giữ N ảnh chụp màn hình gần nhất; kết quả công cụ bị cắt gọn; lịch sử cũ được nén theo đợt.
 """
 
+import re
 import time
 from collections import deque
 
@@ -48,10 +49,13 @@ _MEDIA_RESOLUTION = {
 }
 
 NUDGE_TEXT = "Hãy gọi công cụ tiếp theo hoặc gọi finish_task nếu bạn đã làm xong."
+MAX_IDLE_TURNS = 2          # số lượt liên tiếp mô hình không gọi công cụ trước khi dừng (tránh đốt request)
+MAX_RATE_WAIT_S = 45.0      # 429 theo phút: chờ tối đa chừng này rồi thử lại cùng mô hình
+EXHAUSTED_TTL_S = 3600.0    # mô hình hết hạn ngạch ngày bị bỏ qua trong 1 giờ (không gõ lại mỗi bước/nhiệm vụ con)
 
 
 def _classify_error(e: Exception) -> str:
-    """Phân loại lỗi API: quota | unavailable | fatal | other."""
+    """Phân loại lỗi API: quota | unavailable | fatal | notfound | other."""
     s = str(e).lower()
     code = getattr(e, "code", None) or getattr(e, "status_code", None)
     if code == 429 or "429" in s or "quota" in s or "resource_exhausted" in s:
@@ -60,7 +64,31 @@ def _classify_error(e: Exception) -> str:
         return "unavailable"
     if code in (401, 403) or any(k in s for k in ("api key not valid", "api_key_invalid", "permission_denied", "unauthenticated")):
         return "fatal"
+    if code == 404 or "not_found" in s or "is not found" in s:
+        return "notfound"
     return "other"
+
+
+def quota_info(err: str) -> tuple[bool, float | None]:
+    """
+    Đọc thông báo 429 của Gemini: (hết hạn ngạch NGÀY?, số giây nên chờ theo RetryInfo).
+    Hạn ngạch theo phút (RPM/TPM) chỉ cần chờ vài giây; hạn ngạch ngày (RPD) thì chờ cũng vô ích.
+    """
+    s = str(err)
+    per_day = bool(re.search(r"per\s*day|perday|daily", s, re.I))
+    m = re.search(r"retry[_ ]?delay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", s, re.I) \
+        or re.search(r"retry in (\d+(?:\.\d+)?)\s*s", s, re.I)
+    return per_day, (float(m.group(1)) if m else None)
+
+
+def _sleep_interruptible(seconds: float) -> bool:
+    """Ngủ theo nhịp nhỏ để nút dừng khẩn cấp vẫn có tác dụng. Trả về False nếu bị dừng."""
+    end = time.time() + max(0.0, seconds)
+    while time.time() < end:
+        if safety.is_stopped():
+            return False
+        time.sleep(min(0.25, end - time.time()) if end > time.time() else 0)
+    return True
 
 
 # =====================================================================
@@ -123,6 +151,31 @@ class GeminiBrain:
         self.client = None
         self.key_index = 0
         self._thinking_ok = True
+        self._exhausted: dict[str, float] = {}   # mô hình -> thời điểm bị đánh dấu hết hạn ngạch ngày
+        self.begin_task()
+
+    def begin_task(self):
+        """Đặt lại ngân sách dùng chung cho MỘT nhiệm vụ của người dùng (mọi nhiệm vụ con cộng dồn vào đây)."""
+        self.calls_used = 0
+        self.tokens_used = 0
+
+    def _budget_error(self) -> str:
+        if config.gemini_max_calls and self.calls_used >= config.gemini_max_calls:
+            return (f"Đã dùng hết ngân sách {config.gemini_max_calls} lượt gọi Gemini cho nhiệm vụ này "
+                    "(GEMINI_MAX_CALLS). Dừng để giữ hạn ngạch API.")
+        if config.gemini_max_tokens and self.tokens_used >= config.gemini_max_tokens:
+            return (f"Đã dùng hết ngân sách {config.gemini_max_tokens} token Gemini cho nhiệm vụ này "
+                    "(GEMINI_MAX_TOKENS). Dừng để giữ hạn ngạch API.")
+        return ""
+
+    def _is_exhausted(self, model: str) -> bool:
+        t = self._exhausted.get(model)
+        if t is None:
+            return False
+        if time.time() - t > EXHAUSTED_TTL_S:
+            self._exhausted.pop(model, None)
+            return False
+        return True
 
     def _init_client(self):
         """Khởi tạo Google GenAI Client với API Key hiện tại"""
@@ -160,6 +213,7 @@ class GeminiBrain:
         kwargs = dict(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.2,
+            max_output_tokens=config.gemini_max_output_tokens,
             tools=tools if tools is not None else ALL_TOOLS,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
@@ -173,19 +227,32 @@ class GeminiBrain:
 
     def _generate(self, contents, tools, models):
         """
-        Gọi API với chiến lược dự phòng:
-        - 429/quota: xoay API key (tối đa số key), rồi mới chuyển model.
-        - 503/quá tải: thử lại cùng model 1 lần sau 1.5s, rồi chuyển model.
+        Gọi API với chiến lược dự phòng (ngắt mạch, không quét mù mọi key × mọi mô hình):
+        - 429 theo phút (có retryDelay ngắn): CHỜ đúng retryDelay rồi thử lại cùng mô hình (tối đa 2 lần).
+        - 429 hạn ngạch ngày: xoay API key; hết key -> đánh dấu mô hình đã cạn (bỏ qua ở các bước/nhiệm vụ
+          con sau) rồi mới chuyển mô hình dự phòng (nếu GEMINI_MODEL_FALLBACK=true).
+        - 503/quá tải: thử lại cùng mô hình 1 lần sau 1.5s, rồi chuyển mô hình.
+        - 404 mô hình không tồn tại: chuyển mô hình. Lỗi 400 khác: dừng ngay (đổi mô hình cũng hỏng y hệt).
         - Lỗi xác thực (401/403): dừng ngay, không phí request.
         """
         n_keys = max(1, len(config.gemini_api_keys))
         last_err = ""
-        for model in models:
+        # Tắt dự phòng -> chỉ đúng mô hình chính (chọn TRƯỚC khi lọc, để không trượt sang mô hình khác)
+        pool = models if config.gemini_model_fallback else models[:1]
+        candidates = [m for m in pool if not self._is_exhausted(m)]
+        if not candidates:
+            return None, None, "Mô hình Gemini đã hết hạn ngạch ngày (thử lại sau hoặc thêm API key khác)."
+        for model in candidates:
             rotations = 0
             retried = False
+            waits = 0
             while True:
                 if safety.is_stopped():
                     return None, None, safety.get_stop_reason()
+                budget_err = self._budget_error()   # tính cả lần thử lại / xoay key, không chỉ lần thành công
+                if budget_err:
+                    return None, None, budget_err
+                self.calls_used += 1
                 try:
                     resp = self.client.models.generate_content(
                         model=model, contents=contents, config=self._build_config(tools))
@@ -200,14 +267,29 @@ class GeminiBrain:
                         self._thinking_ok = False
                         self.log("INFO", "Mô hình không hỗ trợ GEMINI_THINKING_LEVEL, bỏ qua tùy chọn này.")
                         continue
-                    if kind == "quota" and rotations < n_keys - 1 and self.rotate_key():
-                        rotations += 1
-                        continue
-                    if kind == "unavailable" and not retried:
+                    if kind == "quota":
+                        per_day, delay = quota_info(last_err)
+                        if not per_day and waits < 2 and (delay is None or delay <= MAX_RATE_WAIT_S):
+                            waits += 1
+                            wait_s = (delay if delay is not None else 5.0 * waits) + 0.5
+                            self.log("WARN", f"Gemini giới hạn tốc độ (429/phút) → chờ {wait_s:.0f}s rồi thử lại {model}...")
+                            self.set_status(f"Chờ hạn ngạch Gemini {wait_s:.0f}s...")
+                            if not _sleep_interruptible(wait_s):
+                                return None, None, safety.get_stop_reason()
+                            continue
+                        if rotations < n_keys - 1 and self.rotate_key():
+                            rotations += 1
+                            continue
+                        if per_day:   # chỉ ghi nhớ khi chắc chắn hết hạn ngạch NGÀY (giới hạn phút tự hồi)
+                            self._exhausted[model] = time.time()
+                    elif kind == "unavailable" and not retried:
                         retried = True
                         time.sleep(1.5)
                         continue
-                    label = {"quota": "Hết hạn ngạch 429", "unavailable": "Bận 503"}.get(kind, "Lỗi")
+                    elif kind == "other":
+                        self.log("ERROR", f"Mô hình {model} từ chối yêu cầu: {one_line(last_err, 200)}")
+                        return None, None, last_err
+                    label = {"quota": "Hết hạn ngạch 429", "unavailable": "Bận 503", "notfound": "Không có mô hình"}.get(kind, "Lỗi")
                     self.log("WARN", f"Mô hình {model} ({label}): {one_line(last_err, 160)} → thử mô hình tiếp theo...")
                     break
         return None, None, last_err
@@ -219,6 +301,7 @@ class GeminiBrain:
         """Chế độ độc lập: Gemini vừa suy nghĩ vừa thao tác cho toàn bộ mục tiêu."""
         safety.reset()
         safety.start_hotkey_listener()
+        self.begin_task()
         self.log("INFO", f"Bắt đầu nhiệm vụ: '{goal}'")
         context = (
             f"MỤC TIÊU CỦA NGƯỜI DÙNG: {goal}\n\n"
@@ -294,8 +377,11 @@ class GeminiBrain:
         reset_run_state()
 
         # Mô hình người dùng chọn luôn được ưu tiên đầu tiên (kể cả khi không nằm trong danh sách dự phòng)
-        current_model = config.gemini_model or FALLBACK_MODELS[0]
-        fallback_models = [current_model] + [m for m in FALLBACK_MODELS if m != current_model]
+        preferred = config.gemini_model or FALLBACK_MODELS[0]
+        fallback_models = [preferred] + [m for m in FALLBACK_MODELS if m != preferred]
+        # Bỏ qua ngay các mô hình đã biết là hết hạn ngạch ngày (không gõ lại ở mỗi nhiệm vụ con)
+        current_model = preferred if not config.gemini_model_fallback else \
+            next((m for m in fallback_models if not self._is_exhausted(m)), preferred)
         if standalone:
             self.log("INFO", f"Mô hình khởi động: {current_model}")
 
@@ -311,10 +397,16 @@ class GeminiBrain:
             return result(False, error=reason, stopped=True, steps=step)
 
         step = 0
+        idle_turns = 0
         while step < max_steps:
             step += 1
             if safety.is_stopped():
                 return stopped_result(step)
+            budget_err = self._budget_error()
+            if budget_err:
+                self.log("WARN", budget_err)
+                self.set_status("Hết ngân sách Gemini")
+                return result(False, error=budget_err, steps=step, api_error=True)
 
             self.set_status(f"Bước {step}/{max_steps}: Gemini đang thực thi ({current_model})...")
             self.log("STEP", f"=== {step_label} {step} ===")
@@ -349,12 +441,16 @@ class GeminiBrain:
                 usage_total["in"] += p_in
                 usage_total["cached"] += p_cached
                 usage_total["out"] += p_out
+                self.tokens_used += p_in + p_out
                 self.log("INFO", f"📊 Token: vào {p_in} (cache {p_cached}) · ra {p_out}")
 
             candidate = response.candidates[0] if response.candidates else None
             model_content = getattr(candidate, "content", None)
             if model_content is None or not model_content.parts:
                 reason = getattr(candidate, "finish_reason", None) if candidate else "không có candidate"
+                idle_turns += 1
+                if idle_turns > MAX_IDLE_TURNS:
+                    return result(False, error=f"Mô hình trả về rỗng {idle_turns} lần liên tiếp ({reason}).", steps=step)
                 self.log("WARN", f"Phản hồi rỗng từ mô hình ({reason}). Yêu cầu thử lại.")
                 contents.append(types.Content(role="user", parts=[types.Part.from_text(text=NUDGE_TEXT)]))
                 continue
@@ -371,8 +467,13 @@ class GeminiBrain:
                 low = thought_text.lower()
                 if "hoàn thành" in low or "đã xong" in low:
                     return result(True, summary=thought_text, steps=step)
+                idle_turns += 1
+                if idle_turns > MAX_IDLE_TURNS:
+                    return result(False, summary=thought_text,
+                                  error=f"Mô hình {idle_turns} lượt liên tiếp không gọi công cụ.", steps=step)
                 contents.append(types.Content(role="user", parts=[types.Part.from_text(text=NUDGE_TEXT)]))
                 continue
+            idle_turns = 0
 
             function_response_parts = []
             image_parts = []

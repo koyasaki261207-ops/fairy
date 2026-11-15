@@ -79,3 +79,21 @@ if __name__ == "__main__":
             fn()
             print(f"OK  {name}")
     print("Tất cả kiểm thử guard đều đạt.")
+
+
+def test_chess_goal_gets_chess_skill_and_lean_toolset():
+    from core.guard import skill_hint
+    from core.tools import select_tools
+    assert suggest_skills("chơi cờ vua với máy trên lichess") == ["chess_play"]
+    hint = skill_hint("chơi cờ vua với máy trên lichess")
+    assert "chess_play()" in hint  # gợi ý nhanh được chèn thẳng, khỏi tốn 1 lượt load_skill
+    names = {f.__name__ for f in select_tools("chơi cờ vua với máy trên lichess")}
+    assert "chess_play" in names and "run_python_code" not in names and len(names) <= 16
+    assert "chess_play" not in {f.__name__ for f in select_tools("mở notepad")}
+
+
+def test_chess_file_task_keeps_file_tools():
+    from core.tools import select_tools
+    names = {f.__name__ for f in select_tools("đọc file PGN ván cờ vua và giải thích")}
+    assert "read_file_content" in names and "chess_play" in names
+    assert "load_skill" in {f.__name__ for f in select_tools("chơi cờ vua trên lichess")}
