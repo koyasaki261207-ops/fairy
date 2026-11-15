@@ -1,0 +1,38 @@
+# ==========================================
+# GITIGNORE - TỰ ĐỘNG HÓA MÁY TÍNH AUTOPILOT
+# ==========================================
+
+# 1. BẢO MẬT KHÓA API (TUYỆT ĐỐI KHÔNG PUSH LÊN GITHUB)
+.env
+*.env
+.env.*
+!.env.example
+
+# 2. MÔI TRƯỜNG ẢO PYTHON & THƯ VIỆN BÊN THỨ 3
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# 3. NHẬT KÝ & ẢNH CHỤP MÀN HÌNH TẠM THỜI
+logs/screenshots/*.jpg
+logs/screenshots/*.png
+@AutomationLog.txt
+*.log
+
+# 4. CÁC THƯ MỤC REPO CON / BINARY NẶNG TẢI TỪ NGOÀI VÀO
+agent-desktop-repo/
+bin/*.tar.gz
+bin/*.zip
+
+# 5. IDE & OS ARTIFACTS
+.vscode/
+.idea/
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
