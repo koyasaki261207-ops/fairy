@@ -687,13 +687,15 @@ TOOL_MAP = {func.__name__: func for func in ALL_TOOLS}
 # ========================================================
 
 class ToolOutcome:
-    __slots__ = ("text", "image", "finished", "summary")
+    __slots__ = ("text", "image", "finished", "summary", "success")
 
-    def __init__(self, text: str, image: bytes | None = None, finished: bool = False, summary: str = ""):
+    def __init__(self, text: str, image: bytes | None = None, finished: bool = False,
+                 summary: str = "", success: bool = True):
         self.text = text
         self.image = image
         self.finished = finished
         self.summary = summary
+        self.success = success
 
 
 def dispatch_tool(fn_name: str, fn_args: dict, max_chars: int = 4000, guard=None) -> ToolOutcome:
@@ -708,7 +710,9 @@ def dispatch_tool(fn_name: str, fn_args: dict, max_chars: int = 4000, guard=None
             if bounce:
                 return ToolOutcome(bounce)
         summary = fn_args.get("summary") or "Đã hoàn thành nhiệm vụ."
-        return ToolOutcome(f"Nhiệm vụ hoàn thành: {summary}", finished=True, summary=summary)
+        ok = fn_args.get("is_success", True)
+        ok = ok if isinstance(ok, bool) else str(ok).strip().lower() not in ("false", "0", "no")
+        return ToolOutcome(f"Nhiệm vụ hoàn thành: {summary}", finished=True, summary=summary, success=ok)
 
     if fn_name == "update_memory" and guard is not None:
         return ToolOutcome(guard.set_notes(str(fn_args.get("notes", ""))))

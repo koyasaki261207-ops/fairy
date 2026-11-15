@@ -70,6 +70,11 @@ class Config:
         self.screenshot_max_dim = max(640, _env_int("SCREENSHOT_MAX_DIM", 1280))
         self.screenshot_quality = min(95, max(30, _env_int("SCREENSHOT_QUALITY", 70)))
         self.save_screenshots = _env_bool("SAVE_SCREENSHOTS", False)
+        # ---- Chế độ kết hợp (AI_PROVIDER=hybrid): Claude lập kế hoạch, Gemini thực thi ----
+        self.planner_max_rounds = max(1, _env_int("PLANNER_MAX_ROUNDS", 8))      # số lượt gọi Claude tối đa
+        self.planner_max_tokens = max(256, _env_int("PLANNER_MAX_TOKENS", 1024))  # token đầu ra mỗi lượt Claude
+        self.executor_max_steps = max(1, _env_int("EXECUTOR_MAX_STEPS", 15))     # bước tối đa mỗi nhiệm vụ con
+        self.report_max_chars = max(300, _env_int("REPORT_MAX_CHARS", 1500))     # độ dài báo cáo gửi Claude
         # Độ phân giải ảnh Gemini: "" (mặc định API), "low", "medium", "high"
         self.gemini_media_resolution = os.getenv("GEMINI_MEDIA_RESOLUTION", "").strip().lower()
 

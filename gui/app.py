@@ -54,6 +54,18 @@ SEG_SELECTED = ("#ffffff", "#636366")
 DISABLED_BG = ("#e5e5ea", "#2c2c2e")
 DISABLED_FG = ("#a1a1a6", "#636366")
 
+PROVIDER_LABELS = {
+    "hybrid": "Kết hợp — Claude lập kế hoạch, Gemini thực thi",
+    "gemini": "Gemini",
+    "claude": "Claude",
+}
+MODE_HINTS = {
+    "hybrid": "Claude chỉ đọc mục tiêu và báo cáo ngắn để quyết định; Gemini làm mọi thao tác và xem ảnh. "
+              "Tiết kiệm token Claude nhất.",
+    "gemini": "Gemini vừa suy nghĩ vừa thao tác.",
+    "claude": "Claude vừa suy nghĩ vừa thao tác (tốn token Claude nhất).",
+}
+
 RADIUS_CARD = 20
 RADIUS_FIELD = 14
 RADIUS_CAPSULE = 22  # = nửa chiều cao nút 44px
@@ -276,10 +288,21 @@ class GeminiAutoPilotApp(ctk.CTk):
         # Lời chào ban đầu
         self._append_log("INFO", "Sẵn sàng. Nhấn F8 hoặc Ctrl+Shift+Q bất cứ lúc nào để dừng khẩn cấp.")
         provider = getattr(config, "ai_provider", "gemini")
-        if provider == "claude" and not getattr(config, "anthropic_api_key", ""):
-            self._append_log("WARN", "Chưa có ANTHROPIC_API_KEY. Mở Cài đặt để thêm khóa.")
-        elif provider != "claude" and not config.gemini_api_key:
-            self._append_log("WARN", "Chưa có GEMINI_API_KEY. Mở Cài đặt để thêm khóa (miễn phí tại aistudio.google.com).")
+        self._append_log("INFO", f"Chế độ: {PROVIDER_LABELS.get(provider, provider)}.")
+        missing = self._missing_key(provider)
+        if missing:
+            self._append_log("WARN", f"{missing} Mở Cài đặt để thêm khóa.")
+
+    @staticmethod
+    def _missing_key(provider: str) -> str:
+        """Trả về thông báo nếu thiếu khóa API cần cho chế độ đang chọn."""
+        need_claude = provider in ("claude", "hybrid")
+        need_gemini = provider in ("gemini", "hybrid")
+        if need_claude and not getattr(config, "anthropic_api_key", ""):
+            return "Chưa có ANTHROPIC_API_KEY (lấy tại console.anthropic.com)."
+        if need_gemini and not config.gemini_api_key:
+            return "Chưa có GEMINI_API_KEY (miễn phí tại aistudio.google.com)."
+        return ""
 
     # =================================================================
     # NHẬT KÝ
@@ -450,9 +473,11 @@ class GeminiAutoPilotApp(ctk.CTk):
     # ĐIỀU PHỐI NHIỆM VỤ
     # =================================================================
     def _get_brain(self, provider: str):
-        """Nạp và cache bộ não theo provider ('gemini' | 'claude')."""
+        """Nạp và cache bộ não theo provider ('gemini' | 'claude' | 'hybrid')."""
         if provider not in self._brains:
-            if provider == "claude":
+            if provider == "hybrid":
+                from core.hybrid_brain import HybridBrain as BrainCls
+            elif provider == "claude":
                 from core.claude_brain import ClaudeBrain as BrainCls
             else:
                 from core.brain import GeminiBrain as BrainCls
@@ -472,24 +497,11 @@ class GeminiAutoPilotApp(ctk.CTk):
             return
 
         provider = getattr(config, "ai_provider", "gemini")
-        if provider == "claude":
-            if not getattr(config, "anthropic_api_key", ""):
-                messagebox.showinfo(
-                    "Cần khóa API của Claude",
-                    "Bạn đã chọn Claude nhưng chưa nhập ANTHROPIC_API_KEY.\n\n"
-                    "Mở Cài đặt để nhập khóa (lấy tại console.anthropic.com)."
-                )
-                self.open_settings_dialog()
-                return
-        else:
-            if not config.gemini_api_key:
-                messagebox.showinfo(
-                    "Cần khóa API của Gemini",
-                    "Bạn chưa nhập khóa Gemini API.\n\n"
-                    "Mở Cài đặt để nhập khóa (miễn phí tại aistudio.google.com)."
-                )
-                self.open_settings_dialog()
-                return
+        missing = self._missing_key(provider)
+        if missing:
+            messagebox.showinfo("Cần khóa API", f"{missing}\n\nMở Cài đặt để nhập khóa.")
+            self.open_settings_dialog()
+            return
 
         try:
             active_brain = self._get_brain(provider)
@@ -622,14 +634,14 @@ class GeminiAutoPilotApp(ctk.CTk):
             )
 
         # ---- Nhà cung cấp ----
-        provider_map = {"Gemini": "gemini", "Claude": "claude"}
+        provider_map = {"Kết hợp": "hybrid", "Gemini": "gemini", "Claude": "claude"}
         reverse_prov = {v: k for k, v in provider_map.items()}
         prov_outer, c = section("Nhà cung cấp AI")
         prov_outer.pack(fill="x")
         row = ctk.CTkFrame(c, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=14)
         seg_provider = ctk.CTkSegmentedButton(
-            row, values=["Gemini", "Claude"], height=34, corner_radius=17, font=self._font(14, "bold"),
+            row, values=list(provider_map), height=34, corner_radius=17, font=self._font(14, "bold"),
             fg_color=CHIP, selected_color=SEG_SELECTED, selected_hover_color=SEG_SELECTED,
             unselected_color=CHIP, unselected_hover_color=CHIP_HOVER,
             text_color=LABEL, border_width=3,
@@ -637,9 +649,14 @@ class GeminiAutoPilotApp(ctk.CTk):
         )
         seg_provider.pack(fill="x")
         seg_provider.set(reverse_prov.get(getattr(config, "ai_provider", "gemini"), "Gemini"))
+        lbl_mode_hint = ctk.CTkLabel(
+            c, text="", anchor="w", justify="left", wraplength=470,
+            font=self._font(12), text_color=LABEL2,
+        )
+        lbl_mode_hint.pack(fill="x", padx=18, pady=(0, 12))
 
         # ---- Gemini ----
-        gemini_outer, gemini_card = section("Gemini")
+        gemini_outer, gemini_card = section("Gemini · tay chân (thực thi, nhìn màn hình)")
         entry_api = entry(field(gemini_card, "Khóa API"), show="•", placeholder="AIzaSy… (nhiều khóa cách nhau bằng dấu phẩy)")
         entry_api.pack(fill="x")
         entry_api.insert(0, getattr(config, "gemini_api_key_raw", None) or config.gemini_api_key or "")
@@ -649,7 +666,7 @@ class GeminiAutoPilotApp(ctk.CTk):
         combo_model.set(config.gemini_model if config.gemini_model in gemini_models else "gemini-3.5-flash")
 
         # ---- Claude ----
-        claude_outer, claude_card = section("Claude")
+        claude_outer, claude_card = section("Claude · bộ não (lập kế hoạch, ra quyết định)")
         entry_claude_api = entry(field(claude_card, "Khóa API"), show="•", placeholder="sk-ant-api03-…")
         entry_claude_api.pack(fill="x")
         entry_claude_api.insert(0, getattr(config, "anthropic_api_key", "") or "")
@@ -667,11 +684,16 @@ class GeminiAutoPilotApp(ctk.CTk):
         perf_outer.pack(fill="x")
 
         def show_provider():
-            """Chỉ hiện phần cài đặt của nhà cung cấp đang chọn."""
+            """Chỉ hiện phần cài đặt cần cho chế độ đang chọn."""
+            mode = provider_map.get(seg_provider.get(), "gemini")
             gemini_outer.pack_forget()
             claude_outer.pack_forget()
-            target = claude_outer if seg_provider.get() == "Claude" else gemini_outer
-            target.pack(fill="x", before=perf_outer)
+            if mode in ("claude", "hybrid"):
+                claude_outer.pack(fill="x", before=perf_outer)
+            if mode in ("gemini", "hybrid"):
+                gemini_outer.pack(fill="x", before=perf_outer)
+            lbl_mode_hint.configure(text=MODE_HINTS[mode])
+            dialog.geometry("560x860" if mode == "hybrid" else "560x700")
 
         show_provider()
         entry_delay = entry(field(perf_card, "Độ trễ (giây)"), width=90)
@@ -706,7 +728,7 @@ class GeminiAutoPilotApp(ctk.CTk):
                 max_steps=new_steps,
                 keep_screenshots=new_shots,
             )
-            self._append_log("INFO", f"Đã lưu cài đặt. Nhà cung cấp hiện tại: {chosen_prov.capitalize()}.")
+            self._append_log("INFO", f"Đã lưu cài đặt. Chế độ: {PROVIDER_LABELS.get(chosen_prov, chosen_prov)}.")
             dialog.destroy()
 
         footer = ctk.CTkFrame(dialog, fg_color="transparent")

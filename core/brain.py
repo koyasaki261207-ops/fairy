@@ -10,6 +10,7 @@ Tối ưu token:
 """
 
 import time
+from collections import deque
 
 from google import genai
 from google.genai import types
@@ -196,66 +197,111 @@ class GeminiBrain:
                     break
         return None, None, last_err
 
+    # =================================================================
+    # API CÔNG KHAI
+    # =================================================================
     def run_task(self, goal: str) -> dict:
-        """
-        Khởi chạy vòng lặp ReAct giải quyết nhiệm vụ của người dùng.
-        """
+        """Chế độ độc lập: Gemini vừa suy nghĩ vừa thao tác cho toàn bộ mục tiêu."""
         safety.reset()
         safety.start_hotkey_listener()
+        self.log("INFO", f"Bắt đầu nhiệm vụ: '{goal}'")
+        context = (
+            f"MỤC TIÊU CỦA NGƯỜI DÙNG: {goal}\n\n"
+            f"{self._system_info()}"
+            f"{skill_hint(goal)}"
+            f"Hãy bắt đầu suy nghĩ và gọi các công cụ phù hợp nhất để hoàn thành mục tiêu."
+        )
+        result = self._run_loop(context, config.max_steps, standalone=True)
+        if result.get("success"):
+            self.set_status("Hoàn thành xuất sắc!")
+            self.log("SUCCESS", f"🎉 {result['summary']}")
+        elif not result.get("stopped"):
+            self.log("WARN", result.get("error") or result.get("summary") or "Chưa hoàn thành.")
+        return result
+
+    def run_subtask(self, instruction: str, success_criteria: str = "", max_steps: int = 15) -> dict:
+        """
+        Chế độ "tay chân": thực hiện 1 nhiệm vụ con do bộ não điều phối (Claude) giao,
+        rồi trả về báo cáo ngắn gọn. Không reset trạng thái dừng khẩn cấp của lượt chạy cha.
+        """
+        context = (
+            f"NHIỆM VỤ CON (do bộ não điều phối giao): {instruction}\n"
+            f"Tiêu chí hoàn thành: {success_criteria or 'tự xác định hợp lý theo nhiệm vụ con'}\n\n"
+            f"{self._system_info()}"
+            f"{skill_hint(instruction)}"
+            "Chỉ làm đúng nhiệm vụ con này, không làm thêm việc khác. Khi xong hoặc bế tắc, gọi finish_task với "
+            "summary nêu RÕ và NGẮN: đã làm gì, kết quả đã kiểm chứng thực tế, và mọi dữ liệu bộ não cần "
+            "(đường dẫn, giá trị, nội dung đọc được, lỗi gặp phải). is_success=False nếu chưa đạt tiêu chí."
+        )
+        return self._run_loop(context, max(1, max_steps), standalone=False)
+
+    # =================================================================
+    # VÒNG LẶP REACT DÙNG CHUNG
+    # =================================================================
+    def _system_info(self) -> str:
+        fg_win = controller.get_foreground_window()
+        screen_w, screen_h = vision.get_screen_size()
+        return (
+            f"Thông tin hệ thống:\n"
+            f"- Cửa sổ đang mở: {fg_win.get('title', 'Không xác định')}\n"
+            f"- Kích thước màn hình: {screen_w} x {screen_h} pixels.\n"
+        )
+
+    def _run_loop(self, initial_context: str, max_steps: int, standalone: bool) -> dict:
+        """
+        Trả về dict: success, summary, error, steps, usage, trace (vài thao tác cuối), notes, stopped.
+        """
+        usage_total = {"in": 0, "cached": 0, "out": 0}
+        trace = deque(maxlen=6)
+        guard = RunGuard()
+
+        def result(success: bool, summary: str = "", error: str = "", stopped: bool = False, steps: int = 0,
+                   api_error: bool = False):
+            self.log(
+                "INFO",
+                f"📊 Gemini: vào {usage_total['in']} (cache {usage_total['cached']}) · ra {usage_total['out']} · {steps} bước",
+            )
+            return {
+                "success": success, "summary": summary, "error": error, "stopped": stopped,
+                "steps": steps, "usage": dict(usage_total), "trace": list(trace), "notes": guard.notes,
+                "api_error": api_error,
+            }
 
         try:
             self._init_client()
         except Exception as e:
             self.log("ERROR", str(e))
             self.set_status("Lỗi API Key")
-            return {"success": False, "error": str(e)}
-
-        self.set_status("Đang khởi động...")
-        self.log("INFO", f"Bắt đầu nhiệm vụ: '{goal}'")
-
-        fg_win = controller.get_foreground_window()
-        screen_w, screen_h = vision.get_screen_size()
-        initial_context = (
-            f"MỤC TIÊU CỦA NGƯỜI DÙNG: {goal}\n\n"
-            f"Thông tin hệ thống:\n"
-            f"- Cửa sổ đang mở: {fg_win.get('title', 'Không xác định')}\n"
-            f"- Kích thước màn hình: {screen_w} x {screen_h} pixels.\n"
-            f"{skill_hint(goal)}"
-            f"Hãy bắt đầu suy nghĩ và gọi các công cụ phù hợp nhất để hoàn thành mục tiêu."
-        )
+            return result(False, error=str(e), api_error=True)
 
         gen_config = self._build_config()
         reset_run_state()
-        guard = RunGuard()
 
         # Mô hình người dùng chọn luôn được ưu tiên đầu tiên (kể cả khi không nằm trong danh sách dự phòng)
         current_model = config.gemini_model or FALLBACK_MODELS[0]
         fallback_models = [current_model] + [m for m in FALLBACK_MODELS if m != current_model]
-        self.log("INFO", f"Mô hình khởi động: {current_model}")
+        if standalone:
+            self.log("INFO", f"Mô hình khởi động: {current_model}")
 
         contents: list[types.Content] = [
             types.Content(role="user", parts=[types.Part.from_text(text=initial_context)])
         ]
+        step_label = "BƯỚC" if standalone else "GEMINI · BƯỚC"
 
-        step = 0
-        max_steps = config.max_steps
-        task_finished = False
-        final_summary = ""
-        usage_total = {"in": 0, "cached": 0, "out": 0}
-
-        def stopped_result():
+        def stopped_result(step):
             reason = safety.get_stop_reason()
             self.log("STOP", f"ĐÃ DỪNG KHẨN CẤP: {reason}")
             self.set_status("Đã dừng")
-            return {"success": False, "error": reason}
+            return result(False, error=reason, stopped=True, steps=step)
 
-        while step < max_steps and not task_finished:
+        step = 0
+        while step < max_steps:
             step += 1
             if safety.is_stopped():
-                return stopped_result()
+                return stopped_result(step)
 
-            self.set_status(f"Bước {step}/{max_steps}: Đang suy luận ({current_model})...")
-            self.log("STEP", f"=== BƯỚC {step} ===")
+            self.set_status(f"Bước {step}/{max_steps}: Gemini đang thực thi ({current_model})...")
+            self.log("STEP", f"=== {step_label} {step} ===")
 
             # Giữ ngữ cảnh gọn trước mỗi request
             prune_gemini_images(contents, config.keep_screenshots)
@@ -268,14 +314,15 @@ class GeminiBrain:
             except Exception as e:
                 self.log("ERROR", f"Lỗi xác thực Gemini API: {e}")
                 self.set_status("Lỗi API Key")
-                return {"success": False, "error": str(e)}
+                return result(False, error=str(e), steps=step, api_error=True)
 
             if safety.is_stopped():
-                return stopped_result()
+                return stopped_result(step)
             if response is None:
                 self.log("ERROR", f"Tất cả các mô hình Gemini đều không phản hồi. Lỗi cuối: {one_line(err, 200)}")
                 self.set_status("Lỗi API/Hết Quota")
-                return {"success": False, "error": "Không thể nhận phản hồi từ Gemini API."}
+                return result(False, error=f"Không thể nhận phản hồi từ Gemini API: {one_line(err, 200)}", steps=step,
+                              api_error=True)
             current_model = used_model
 
             um = getattr(response, "usage_metadata", None)
@@ -307,52 +354,41 @@ class GeminiBrain:
             if not function_calls:
                 low = thought_text.lower()
                 if "hoàn thành" in low or "đã xong" in low:
-                    task_finished = True
-                    final_summary = thought_text
-                    break
+                    return result(True, summary=thought_text, steps=step)
                 contents.append(types.Content(role="user", parts=[types.Part.from_text(text=NUDGE_TEXT)]))
                 continue
 
             function_response_parts = []
             image_parts = []
+            finished = None
             for fc in function_calls:
                 if safety.is_stopped():
-                    return stopped_result()
+                    return stopped_result(step)
 
                 fn_name = fc.name
                 fn_args = dict(fc.args or {})
                 self.log("ACTION", f"⚡ {fn_name}({format_args(fn_args)})")
-                self.set_status(f"Đang thực thi: {fn_name}")
+                self.set_status(f"Gemini thực thi: {fn_name}")
 
                 outcome = dispatch_tool(fn_name, fn_args, config.max_tool_result_chars, guard=guard)
                 if outcome.finished:
-                    task_finished = True
-                    final_summary = outcome.summary
+                    finished = outcome
                 if outcome.image:
                     image_parts.append(types.Part.from_bytes(data=outcome.image, mime_type="image/jpeg"))
 
                 self.log("OBSERVATION", f"👁️ Kết quả: {outcome.text}")
+                trace.append(f"{fn_name}({format_args(fn_args, 40)}) → {one_line(outcome.text, 160)}")
                 function_response_parts.append(
                     types.Part.from_function_response(name=fn_name, response={"result": outcome.text})
                 )
 
-            if task_finished:
-                break
+            if finished is not None:
+                return result(finished.success, summary=finished.summary,
+                              error="" if finished.success else finished.summary, steps=step)
 
             notes = guard.pending_notes_text()
             extra = [types.Part.from_text(text=notes)] if notes else []
             contents.append(types.Content(role="user", parts=function_response_parts + image_parts + extra))
 
-        self.log(
-            "INFO",
-            f"📊 Tổng token: vào {usage_total['in']} (cache {usage_total['cached']}) · ra {usage_total['out']} · {step} bước",
-        )
-        if task_finished:
-            self.set_status("Hoàn thành xuất sắc!")
-            self.log("SUCCESS", f"🎉 {final_summary}")
-            return {"success": True, "summary": final_summary}
-
         self.set_status("Hết số bước tối đa")
-        msg = f"Đã đạt giới hạn {max_steps} bước nhưng chưa hoàn thành toàn bộ."
-        self.log("WARN", msg)
-        return {"success": False, "error": msg}
+        return result(False, error=f"Đã đạt giới hạn {max_steps} bước nhưng chưa hoàn thành.", steps=step)

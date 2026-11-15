@@ -21,6 +21,9 @@ CLI_ICONS = {
 
 
 def _make_brain(provider: str, logger):
+    if provider == "hybrid":
+        from core.hybrid_brain import HybridBrain
+        return HybridBrain(log_callback=logger), f"Claude {config.claude_model} + Gemini {config.gemini_model}"
     if provider == "claude":
         from core.claude_brain import ClaudeBrain
         return ClaudeBrain(log_callback=logger), config.claude_model
@@ -57,7 +60,7 @@ def main():
     parser.add_argument("--cli", type=str, help="Chạy nhiệm vụ trực tiếp qua dòng lệnh CLI mà không mở GUI")
     parser.add_argument(
         "--provider",
-        choices=["gemini", "claude"],
+        choices=["gemini", "claude", "hybrid"],
         default=None,
         help="Chọn AI provider cho chế độ CLI (mặc định theo AI_PROVIDER trong .env)",
     )

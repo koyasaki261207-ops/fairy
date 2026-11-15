@@ -124,6 +124,7 @@ class ClaudeBrain:
         step = 0
         max_steps = config.max_steps
         task_finished = False
+        final_success = True
         final_summary = ""
         usage_total = {"in": 0, "cache_read": 0, "cache_write": 0, "out": 0}
 
@@ -215,6 +216,7 @@ class ClaudeBrain:
                 if outcome.finished:
                     task_finished = True
                     final_summary = outcome.summary
+                    final_success = outcome.success
                 self.log("OBSERVATION", f"👁️ Kết quả: {outcome.text}")
 
                 if outcome.image:
@@ -244,6 +246,10 @@ class ClaudeBrain:
             f"📊 Tổng token: vào {usage_total['in']} · đọc cache {usage_total['cache_read']} · "
             f"ghi cache {usage_total['cache_write']} · ra {usage_total['out']} · {step} bước",
         )
+        if task_finished and not final_success:
+            self.set_status("Chưa hoàn thành")
+            self.log("WARN", final_summary)
+            return {"success": False, "summary": final_summary, "error": final_summary}
         if task_finished:
             self.set_status("Hoàn thành xuất sắc!")
             self.log("SUCCESS", f"🎉 {final_summary}")
